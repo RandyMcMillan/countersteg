@@ -15,5 +15,7 @@ pub use composer::{
     TICKS_PER_BEAT, TICKS_PER_NOTE,
 };
 pub use species::first::{compose, compose_with, decisions_of, Composition};
-pub use midi::{read_smf, write_smf, write_smf_named, NoteEvent, SmfData};
+pub use midi::{
+    read_smf, write_smf, write_smf2, write_smf2_named, write_smf_named, NoteEvent, SmfData,
+};
 pub use theory::Note;

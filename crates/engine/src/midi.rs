@@ -3,6 +3,10 @@
 
 use crate::composer::TICKS_PER_NOTE;
 use crate::species::first::Composition;
+use crate::species::second::Composition2;
+
+/// Half-note duration in ticks (second-species CP voice).
+const TICKS_PER_HALF: u32 = TICKS_PER_NOTE / 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoteEvent {
@@ -145,9 +149,69 @@ pub fn read_smf(bytes: &[u8]) -> Result<SmfData, String> {
     Ok(data)
 }
 
+impl Composition2 {
+    /// Flatten to timed MIDI events. Interior positions emit two half notes;
+    /// boundary positions (0, len-1) emit a single whole-note event.
+    pub fn events(&self) -> Vec<NoteEvent> {
+        let len = self.cf.len();
+        let mut evs = Vec::with_capacity(self.cf.len() + 2 * len);
+        for (i, n) in self.cf.iter().enumerate() {
+            evs.push(NoteEvent {
+                tick: i as u32 * TICKS_PER_NOTE,
+                duration: TICKS_PER_NOTE,
+                midi: n.midi(),
+                voice: 0,
+            });
+        }
+        for i in 0..len {
+            let base = i as u32 * TICKS_PER_NOTE;
+            let a = self.cp[2 * i];
+            if i == 0 || i == len - 1 {
+                // Whole note: the repeated pair (a, a) is one sounding note.
+                evs.push(NoteEvent {
+                    tick: base,
+                    duration: TICKS_PER_NOTE,
+                    midi: a.midi(),
+                    voice: 1,
+                });
+            } else {
+                let b = self.cp[2 * i + 1];
+                evs.push(NoteEvent {
+                    tick: base,
+                    duration: TICKS_PER_HALF,
+                    midi: a.midi(),
+                    voice: 1,
+                });
+                evs.push(NoteEvent {
+                    tick: base + TICKS_PER_HALF,
+                    duration: TICKS_PER_HALF,
+                    midi: b.midi(),
+                    voice: 1,
+                });
+            }
+        }
+        evs
+    }
+}
+
 /// Write a format-0 SMF: tempo 120bpm, CF on ch0, CP on ch1, whole notes.
 /// `track_name` is embedded as a track-name meta event (used for the seed).
 pub fn write_smf_named(comp: &Composition, track_name: Option<&str>) -> Vec<u8> {
+    encode_smf(comp.events(), track_name)
+}
+
+/// Second-species variant: CP voice carries half notes (whole notes at the
+/// boundaries). Same encoder; `read_smf` parses both transparently.
+pub fn write_smf2_named(comp: &Composition2, track_name: Option<&str>) -> Vec<u8> {
+    encode_smf(comp.events(), track_name)
+}
+
+/// Write without a track-name meta.
+pub fn write_smf2(comp: &Composition2) -> Vec<u8> {
+    write_smf2_named(comp, None)
+}
+
+fn encode_smf(events: Vec<NoteEvent>, track_name: Option<&str>) -> Vec<u8> {
     let mut track: Vec<u8> = Vec::new();
 
     // Track name meta (optional; carries the generation seed).
@@ -164,7 +228,7 @@ pub fn write_smf_named(comp: &Composition, track_name: Option<&str>) -> Vec<u8> 
 
     // Build a time-ordered event list; note-offs before note-ons at same tick.
     let mut evs: Vec<(u32, u8, u8, bool)> = Vec::new(); // (tick, midi, voice, is_on)
-    for e in comp.events() {
+    for e in events {
         evs.push((e.tick, e.midi, e.voice, true));
         evs.push((e.tick + e.duration, e.midi, e.voice, false));
     }
@@ -232,6 +296,43 @@ mod tests {
         let cp: Vec<u8> = comp.cp.iter().map(|n| n.midi()).collect();
         assert_eq!(data.cf, cf);
         assert_eq!(data.cp, cp);
+        assert_eq!(data.track_name.as_deref(), Some("seed:7"));
+    }
+
+    #[test]
+    fn smf2_structure() {
+        let comp = crate::species::second::compose2(1, 8);
+        let bytes = write_smf2(&comp);
+        assert_eq!(&bytes[0..4], b"MThd");
+        assert_eq!(&bytes[14..18], b"MTrk");
+        // CF whole notes + CP half notes (boundaries are single whole notes).
+        let expected = comp.cf.len() + 2 * comp.cf.len() - 2;
+        let ons = bytes.windows(2).filter(|w| w[0] == 0x90).count()
+            + bytes.windows(2).filter(|w| w[0] == 0x91).count();
+        let offs = bytes.windows(2).filter(|w| w[0] == 0x80).count()
+            + bytes.windows(2).filter(|w| w[0] == 0x81).count();
+        assert_eq!(ons, expected);
+        assert_eq!(offs, ons);
+    }
+
+    #[test]
+    fn smf2_roundtrip() {
+        let comp = crate::species::second::compose2(7, 12);
+        let bytes = write_smf2_named(&comp, Some("seed:7"));
+        let data = read_smf(&bytes).unwrap();
+        let cf: Vec<u8> = comp.cf.iter().map(|n| n.midi()).collect();
+        assert_eq!(data.cf, cf);
+        // The sounded CP list: flat half notes minus the repeated boundary
+        // upbeats (indices 1 and 2*len - 1 are one sounding whole note).
+        let len = comp.cf.len();
+        let sounded: Vec<u8> = comp
+            .cp
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1 && *i != 2 * len - 1)
+            .map(|(_, n)| n.midi())
+            .collect();
+        assert_eq!(data.cp, sounded);
         assert_eq!(data.track_name.as_deref(), Some("seed:7"));
     }
 }
