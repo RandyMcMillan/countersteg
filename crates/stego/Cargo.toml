@@ -7,5 +7,4 @@ license = "MIT"
 
 [dependencies]
 engine = { path = "../engine" }
-entropy = { path = "../entropy" }
 keys = { path = "../keys" }
