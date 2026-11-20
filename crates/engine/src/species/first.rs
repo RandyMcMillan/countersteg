@@ -6,7 +6,8 @@
 //! are logged so the stego layer can recover the exact choice sequence.
 
 use crate::composer::{Chooser, Decision};
-use crate::species::{scale_notes_in_range, CF_HIGH, CF_LOW, CP_HIGH, CP_LOW};
+use crate::species::cf::{cf_decisions, cf_prev_of, walk_cf};
+use crate::species::{scale_notes_in_range, CP_HIGH, CP_LOW};
 use crate::theory::{is_consonant, is_perfect, Note};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,34 +16,8 @@ pub struct Composition {
     pub cf: Vec<Note>,
     /// First-species counterpoint: one whole note per position.
     pub cp: Vec<Note>,
-    /// Decision points in generation order.
+    /// Decision points in generation order (CF walk first, then CP).
     pub decisions: Vec<Decision>,
-}
-
-/// Weighted Markov candidates for the next CF note (diatonic steps -4..=4,
-/// excluding unisons, range-bounded). Sorted by midi pitch for determinism.
-fn cf_candidates(prev: Note, prev_prev: Option<Note>) -> Vec<Note> {
-    let mut cands: Vec<Note> = scale_notes_in_range(CF_LOW, CF_HIGH)
-        .into_iter()
-        .filter(|n| {
-            let d = Note::diatonic_distance(prev, *n);
-            (1..=4).contains(&d.abs()) && {
-                // Fux: a leap must be followed by a step in the opposite direction.
-                if let Some(pp) = prev_prev {
-                    let prev_move = Note::diatonic_distance(pp, prev);
-                    if prev_move.abs() >= 3 {
-                        let this_move = d;
-                        // stepwise and contrary to the leap
-                        return this_move.abs() <= 2 && this_move.signum() == -prev_move.signum();
-                    }
-                }
-                true
-            }
-        })
-        .collect();
-    cands.sort_by_key(|n| n.midi());
-    cands.dedup();
-    cands
 }
 
 /// First-species counterpoint candidates against `cf` at position `i`,
@@ -112,38 +87,6 @@ fn cp_rule_ok(cf: Note, cp: Note, prev_cp: Option<Note>, pos: u32, len: u32, str
         }
     }
     true
-}
-
-/// Candidate notes for the cantus firmus at position `i`, given the notes
-/// already fixed at positions `< i`. Mirrors the generation path exactly.
-fn cf_step_candidates(cf_prefix: &[Note], i: usize, len: usize) -> Vec<Note> {
-    let last = cf_prefix[cf_prefix.len() - 1];
-    let prev_prev = if cf_prefix.len() >= 2 {
-        Some(cf_prefix[cf_prefix.len() - 2])
-    } else {
-        None
-    };
-    let mut cands = cf_candidates(last, prev_prev);
-    if cands.is_empty() {
-        // Dead end at range edge: relax the leap-follow rule.
-        cands = scale_notes_in_range(CF_LOW, CF_HIGH)
-            .into_iter()
-            .filter(|n| {
-                let d = Note::diatonic_distance(last, *n);
-                (1..=4).contains(&d.abs())
-            })
-            .collect();
-        cands.sort_by_key(|n| n.midi());
-        cands.dedup();
-    }
-    if i == len - 1 {
-        // End on tonic.
-        cands.retain(|n| *n == Note::new(0, 0));
-        if cands.is_empty() {
-            cands.push(Note::new(0, 0));
-        }
-    }
-    cands
 }
 
 /// Candidate notes for the counterpoint at position `i`, given all CF notes
@@ -225,22 +168,11 @@ fn cp_step_candidates(cf: &[Note], cp_prefix: &[Note], i: usize, len: usize) -> 
 pub fn compose_with<C: Chooser>(len: usize, chooser: &mut C) -> Composition {
     assert!(len >= 4, "need at least 4 positions for species rules");
 
-    let mut cf: Vec<Note> = Vec::with_capacity(len);
-    let mut cp: Vec<Note> = Vec::with_capacity(len);
-    let mut decisions: Vec<Decision> = Vec::new();
-
-    // --- Cantus firmus: start on tonic, end on tonic, random walk between. ---
-    cf.push(Note::new(0, 0)); // C4
-
-    for i in 1..len {
-        let cands = cf_step_candidates(&cf, i, len);
-        let arity = cands.len() as u32;
-        let choice = chooser.choose(arity).min(arity - 1);
-        decisions.push(Decision { arity, choice });
-        cf.push(cands[choice as usize]);
-    }
+    // --- Cantus firmus: shared walk (species-independent). ---
+    let (cf, mut decisions) = walk_cf(len, chooser);
 
     // --- Counterpoint: note against note, rule-validated. ---
+    let mut cp: Vec<Note> = Vec::with_capacity(len);
     for i in 0..len {
         let cands = cp_step_candidates(&cf, &cp, i, len);
         let arity = cands.len() as u32;
@@ -260,23 +192,12 @@ pub fn compose_with<C: Chooser>(len: usize, chooser: &mut C) -> Composition {
 /// Returns Err if any note is not in the candidate set (tampered or
 /// non-countersteg MIDI).
 pub fn decisions_of(cf: &[Note], cp: &[Note]) -> Result<Vec<Decision>, String> {
-    if cf.len() < 4 || cf.len() != cp.len() {
-        return Err("need equal voice lengths >= 4".into());
+    if cf.len() != cp.len() {
+        return Err("need equal voice lengths".into());
     }
     let len = cf.len();
-    let mut decisions = Vec::with_capacity(2 * len - 1);
-
-    for i in 1..len {
-        let cands = cf_step_candidates(&cf[..i], i, len);
-        let choice = cands
-            .iter()
-            .position(|n| *n == cf[i])
-            .ok_or_else(|| format!("cf note {i} not in candidate set"))?;
-        decisions.push(Decision {
-            arity: cands.len() as u32,
-            choice: choice as u32,
-        });
-    }
+    let mut decisions = cf_decisions(cf)?;
+    decisions.reserve(len);
 
     for i in 0..len {
         let cands = cp_step_candidates(cf, &cp[..i], i, len);
@@ -291,10 +212,6 @@ pub fn decisions_of(cf: &[Note], cp: &[Note]) -> Result<Vec<Decision>, String> {
     }
 
     Ok(decisions)
-}
-
-fn cf_prev_of(cf: &[Note], i: usize) -> Note {
-    if i == 0 { cf[0] } else { cf[i - 1] }
 }
 
 /// Plain composition from a seed.
