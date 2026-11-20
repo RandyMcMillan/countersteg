@@ -14,9 +14,13 @@
 //! - [`first`]: first species — one whole note against each cantus firmus
 //!   note. Only consonances, perfect at the boundaries, imperfect at the
 //!   penultimate position.
+//! - [`second`]: second species — two half notes per CF note. Downbeats
+//!   reuse the first-species rule set; upbeats add consonances and
+//!   same-direction passing tones. Boundary positions are whole notes.
 
 pub(crate) mod cf;
 pub mod first;
+pub mod second;
 
 use crate::theory::Note;
 
