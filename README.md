@@ -59,10 +59,19 @@ to let GitHub Actions build and publish the demo to GitHub Pages automatically
 
 ```sh
 countersteg compose --seed 42 --bars 16 --out plain.mid
-countersteg embed   --seed 42 --message "attack at dawn" --key s3cret --out stego.mid
-countersteg extract --in stego.mid --key s3cret
+countersteg embed   --seed 42 --message "attack at dawn" --key "dawn chorus over the rooftops" --out stego.mid
+countersteg extract --in stego.mid --key "dawn chorus over the rooftops"
 countersteg stats   --in stego.mid
 ```
+
+## Passphrases
+
+The 100k-round key stretch slows offline guessing but cannot stop it —
+passphrase entropy is the only real defense (MITIGATIONS.md M5). Aim for
+>= 80 bits: ~16 random alphanumeric characters, or 5+ Diceware words. The
+CLI refuses passphrases under 12 characters or with fewer than 6 distinct
+characters at embed time (`--allow-weak-key` overrides for demos/tests;
+extraction always accepts whatever key you present).
 
 ## Tests
 
