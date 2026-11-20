@@ -6,4 +6,5 @@ members = [
     "crates/entropy",
     "crates/keys",
     "crates/cli",
+    "crates/wasm",
 ]
