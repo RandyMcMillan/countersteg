@@ -1,6 +1,12 @@
-//! keys: passphrase key schedule.
-//! SHA-256("countersteg" || passphrase || seed_le64) -> 32-byte session key
-//! -> xoroshiro128++ keystream. Self-contained SHA-256 (FIPS 180-4).
+//! keys: passphrase key schedule (v2).
+//! SHA-256("countersteg-v2" || passphrase || nonce_le64), iterated ~100k
+//! rounds (PBKDF2-flavored stretching) -> 32-byte session key
+//! -> SHA-256-CTR keystream (block i = SHA-256(key || le64(i))).
+//! Self-contained SHA-256 (FIPS 180-4); zero dependencies.
+//!
+//! The v2 schedule replaces the v1 xoroshiro128++ keystream (a
+//! non-cryptographic PRNG vulnerable to state recovery from known output)
+//! and the 1-byte MAC (1/256 forgery odds). See MITIGATIONS.md (M2, M3).
 
 /// SHA-256 digest of `parts`.
 pub fn sha256(parts: &[&[u8]]) -> [u8; 32] {
@@ -84,26 +90,95 @@ pub fn sha256(parts: &[&[u8]]) -> [u8; 32] {
     out
 }
 
-/// Derive a 32-byte session key from passphrase + seed.
-pub fn derive_key(passphrase: &str, seed: u64) -> [u8; 32] {
-    sha256(&[
-        b"countersteg-v1",
+/// Key-stretching rounds applied on top of the initial digest. ~100k
+/// iterated SHA-256 compressions make offline passphrase guessing cost
+/// real work even though a single SHA-256 is cheap.
+pub const STRETCH_ROUNDS: u32 = 100_000;
+
+/// Derive a 32-byte session key from passphrase + nonce.
+///
+/// v2: initial digest SHA-256("countersteg-v2" || passphrase || nonce_le64)
+/// is then fed through `STRETCH_ROUNDS` iterations of SHA-256(state).
+pub fn derive_key(passphrase: &str, nonce: u64) -> [u8; 32] {
+    let mut key = sha256(&[
+        b"countersteg-v2",
         passphrase.as_bytes(),
-        &seed.to_le_bytes(),
-    ])
+        &nonce.to_le_bytes(),
+    ]);
+    for _ in 0..STRETCH_ROUNDS {
+        key = sha256(&[&key]);
+    }
+    key
+}
+
+/// SHA-256-CTR keystream: block `i` is `SHA-256(key || le64(i))`, bytes
+/// served sequentially. A proper stream cipher built from the existing
+/// primitive — no PRNG state to recover.
+pub struct Sha256Ctr {
+    key: [u8; 32],
+    counter: u64,
+    buf: [u8; 32],
+    pos: usize,
+}
+
+impl Sha256Ctr {
+    /// Start a keystream from an already-derived session key (avoids
+    /// repeating the stretching when the caller derives once per operation).
+    pub fn from_key(key: [u8; 32]) -> Self {
+        Self { key, counter: 0, buf: [0; 32], pos: 32 }
+    }
+
+    fn new(key: [u8; 32]) -> Self {
+        Self::from_key(key)
+    }
+
+    pub fn next_byte(&mut self) -> u8 {
+        if self.pos == 32 {
+            let mut block_input = Vec::with_capacity(40);
+            block_input.extend_from_slice(&self.key);
+            block_input.extend_from_slice(&self.counter.to_le_bytes());
+            self.buf = sha256(&[&block_input]);
+            self.counter = self.counter.wrapping_add(1);
+            self.pos = 0;
+        }
+        let b = self.buf[self.pos];
+        self.pos += 1;
+        b
+    }
 }
 
 /// Keystream generator for the pre-cipher layer.
-pub fn keystream(passphrase: &str, seed: u64) -> entropy::Xoroshiro128PlusPlus {
-    entropy::Xoroshiro128PlusPlus::from_seed_bytes(&derive_key(passphrase, seed))
+pub fn keystream(passphrase: &str, nonce: u64) -> Sha256Ctr {
+    Sha256Ctr::new(derive_key(passphrase, nonce))
 }
 
-/// One-byte MAC tag over the ciphertext (faux_hmac.rs gist pattern, upgraded
-/// to HMAC-style: SHA-256(key || data)). Wrong-key detection reliability
-/// ~255/256 per attempt.
-pub fn mac_tag(passphrase: &str, seed: u64, data: &[u8]) -> u8 {
-    let key = derive_key(passphrase, seed);
-    sha256(&[b"countersteg-mac", &key, data])[0]
+/// XOR `data` with the keystream derived from an already-derived key.
+pub fn apply_keystream_with_key(data: &mut [u8], key: &[u8; 32]) {
+    let mut ks = Sha256Ctr::from_key(*key);
+    for b in data.iter_mut() {
+        *b ^= ks.next_byte();
+    }
+}
+
+/// XOR `data` with the keystream derived from passphrase + nonce.
+pub fn apply_keystream(data: &mut [u8], passphrase: &str, nonce: u64) {
+    apply_keystream_with_key(data, &derive_key(passphrase, nonce));
+}
+
+/// 16-byte MAC tag over the ciphertext from an already-derived key
+/// (HMAC-style: SHA-256(key || data), truncated to 128 bits).
+pub fn mac_tag_from_key(key: &[u8; 32], data: &[u8]) -> [u8; 16] {
+    let d = sha256(&[b"countersteg-mac-v2", key, data]);
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&d[..16]);
+    tag
+}
+
+/// 16-byte MAC tag over the ciphertext (HMAC-style: SHA-256(key || data),
+/// truncated to 128 bits). Wrong-key/tamper detection reliability
+/// ~1 - 2^-128.
+pub fn mac_tag(passphrase: &str, nonce: u64, data: &[u8]) -> [u8; 16] {
+    mac_tag_from_key(&derive_key(passphrase, nonce), data)
 }
 
 #[cfg(test)]
