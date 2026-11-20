@@ -15,6 +15,7 @@
 //!   note. Only consonances, perfect at the boundaries, imperfect at the
 //!   penultimate position.
 
+pub(crate) mod cf;
 pub mod first;
 
 use crate::theory::Note;
