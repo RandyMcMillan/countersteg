@@ -31,11 +31,15 @@ The seed is the generator's only randomness source.
   pick among rule-valid counterpoint choices whenever no stego payload is
   steering.
 - The seed is written into the SMF track name as `seed:N`
-  (`write_smf_named(..., Some(&format!("seed:{seed}")))`); the Extract tab
-  reads it back, so only the passphrase must be shared out of band.
+  (`write_smf_named(..., Some(&format!("seed:{seed}")))`); for Compose output
+  this is a public demo convenience, not a secret. Embedded files (Embed tab
+  / CLI `embed`) write no track name at all: a random nonce travels inside
+  the framing and keys the keystream, so only the passphrase must be shared
+  out of band.
 - Contrast with Embed: the same deterministic engine, but note choices are
-  driven by the keystream derived from passphrase + seed (XORed with the
+  driven by the keystream derived from passphrase + nonce (XORed with the
   message, then the resulting bitstream — not the raw PRNG — chooses the
-  notes).
+  notes), and the tail past the message is driven by the engine's own PRNG
+  rather than zero padding.
 
 CLI equivalent: `countersteg compose --seed <N> --bars <N>`.
