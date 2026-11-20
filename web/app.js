@@ -185,10 +185,22 @@ document.getElementById('btn-compose').addEventListener('click', async (ev) => {
   }
 });
 
+// Random per-message nonce (framing v2): uniqueness, not secrecy.
+// Falls back to Math.random only if Web Crypto is unavailable.
+function randomNonce() {
+  if (window.crypto && window.crypto.getRandomValues) {
+    const buf = new BigUint64Array(1);
+    window.crypto.getRandomValues(buf);
+    return buf[0].toString();
+  }
+  return String(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER));
+}
+
 document.getElementById('btn-embed').addEventListener('click', async (ev) => {
   ev.target.disabled = true;
   try {
-    const seed = document.getElementById('e-seed').value;
+    const seedField = document.getElementById('e-seed').value.trim();
+    const seed = seedField || randomNonce();
     const msg = document.getElementById('e-msg').value;
     const midi = await embedMidi(
       msg,
@@ -197,7 +209,7 @@ document.getElementById('btn-embed').addEventListener('click', async (ev) => {
       document.getElementById('e-bars').value,
     );
     const el = show('out-embed', 'ok', download(midi, `countersteg-embed-${seedName(seed)}.mid`));
-    el.append(`\n${msg.length} bytes hidden in ${midi.length} bytes of counterpoint (seed:${seed})`);
+    el.append(`\n${msg.length} bytes hidden in ${midi.length} bytes of counterpoint (nonce:${seed})`);
     last.embed = midi;
     document.getElementById('play-embed').disabled = false;
   } catch (e) {
