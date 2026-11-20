@@ -2,7 +2,7 @@
 //! the RustCrypto `sha2` crate (FIPS 180-4 implementation). Dev-dependencies
 //! only — the library itself stays zero-dependency.
 
-use keys::{derive_key, mac_tag, sha256};
+use keys::{derive_key, keystream, mac_tag, sha256, STRETCH_ROUNDS};
 use sha2::{Digest, Sha256};
 
 fn pseudo_msg(len: usize) -> Vec<u8> {
@@ -48,22 +48,47 @@ fn derive_key_matches_sha2_composition() {
         ("üñïçødé", 42),
         ("a much longer passphrase with spaces and UPPERlower123", 0xdead_beef),
     ];
-    for (pass, seed) in cases {
+    for (pass, nonce) in cases {
+        // v2 schedule: initial digest, then STRETCH_ROUNDS iterated SHA-256.
         let mut h = Sha256::new();
-        h.update(b"countersteg-v1");
+        h.update(b"countersteg-v2");
         h.update(pass.as_bytes());
-        h.update(seed.to_le_bytes());
-        assert_eq!(derive_key(pass, *seed).as_slice(), h.finalize().as_slice(), "pass {pass:?}");
+        h.update(nonce.to_le_bytes());
+        let mut expect = h.finalize();
+        for _ in 0..STRETCH_ROUNDS {
+            expect = Sha256::digest(&expect);
+        }
+        assert_eq!(derive_key(pass, *nonce).as_slice(), expect.as_slice(), "pass {pass:?}");
     }
 }
 
 #[test]
 fn mac_tag_matches_sha2_composition() {
     let data = pseudo_msg(64);
-    let key = derive_key("pw", 7);
+    // v2 tag: first 16 bytes of SHA-256("countersteg-mac-v2" || key || data)
     let mut h = Sha256::new();
-    h.update(b"countersteg-mac");
-    h.update(key);
+    h.update(b"countersteg-mac-v2");
+    h.update(derive_key("pw", 7));
     h.update(&data);
-    assert_eq!(mac_tag("pw", 7, &data), h.finalize()[0]);
+    let expect = h.finalize();
+    assert_eq!(mac_tag("pw", 7, &data), expect[..16]);
+}
+
+#[test]
+fn keystream_matches_sha2_ctr_construction() {
+    // block i = SHA-256(key || le64(i)); the stream concatenates block bytes.
+    let key = derive_key("stream vector", 42);
+    let mut g = keystream("stream vector", 42);
+    let mut ours = Vec::new();
+    for _ in 0..96 {
+        ours.push(g.next_byte());
+    }
+    let mut expect = Vec::new();
+    for i in 0..3u64 {
+        let mut h = Sha256::new();
+        h.update(key);
+        h.update(i.to_le_bytes());
+        expect.extend_from_slice(&h.finalize());
+    }
+    assert_eq!(ours, expect);
 }
