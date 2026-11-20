@@ -5,8 +5,5 @@ edition = "2021"
 description = "Passphrase key schedule (SHA-256) for the pre-cipher layer"
 license = "MIT"
 
-[dependencies]
-entropy = { path = "../entropy" }
-
 [dev-dependencies]
 sha2 = "0.10"
