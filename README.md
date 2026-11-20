@@ -33,6 +33,22 @@ the score until the payload fits.
 - `crates/entropy` — xoroshiro128++ keystream, Shannon entropy, uniformity
 - `crates/keys` — SHA-256 key schedule, MAC tag
 - `crates/cli` — `countersteg` binary
+- `crates/wasm` — zero-dependency `wasm32-unknown-unknown` bindings (raw FFI,
+  no wasm-bindgen): `compose_midi` / `embed_midi` / `extract_message`
+- `web/` — browser studio UI (compose / embed / extract tabs) served by the
+  GitHub Pages workflow
+
+## WASM + web demo
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo build --release -p countersteg-wasm --target wasm32-unknown-unknown
+# -> target/wasm32-unknown-unknown/release/countersteg_wasm.wasm
+```
+
+Serve `web/` plus the `.wasm` from any static host, or merge `.github/workflows/pages.yml`
+to let GitHub Actions build and publish the demo to GitHub Pages automatically
+(the page loads `countersteg_wasm.wasm`, falling back to `countersteg_wasm.b64`).
 
 ## Usage
 
@@ -54,5 +70,5 @@ cargo test --workspace   # 29 tests: rules, roundtrips, wrong-key, CLI e2e
 - M5: statistical distinguishability panel (NIST 800-90b battery over scores
   with/without payload)
 - M6: SVG-filter delivery channel (HighlightStego.rs), HTML bundle
-- M7: WASM build + web UI; desktop shell via wry/tauri
+- M7: ~~WASM build + web UI~~ done (`crates/wasm` + `web/` + Pages workflow); desktop shell via wry/tauri remains
 - Optional anchor: signet OP_RETURN timestamping + Sigma-protocol receipt
