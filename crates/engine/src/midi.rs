@@ -1,7 +1,8 @@
 //! Minimal Standard MIDI File writer (format 0, no dependencies).
 //! Cantus firmus -> channel 0, counterpoint -> channel 1.
 
-use crate::composer::{Composition, TICKS_PER_NOTE};
+use crate::composer::TICKS_PER_NOTE;
+use crate::species::first::Composition;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoteEvent {
@@ -84,7 +85,7 @@ pub fn read_smf(bytes: &[u8]) -> Result<SmfData, String> {
         return Err("not a MIDI file (bad MThd)".into());
     }
     let hdr_len = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    let ntracks = u16::from_be_bytes(bytes[10..12].try_into().unwrap());
+    let ntracks = u16::from_be_bytes(bytes[10..12].try_into().unwrap()) as usize;
     if ntracks != 1 {
         return Err("expected format 0 (single track)".into());
     }
@@ -205,7 +206,7 @@ pub fn write_smf(comp: &Composition) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::composer::compose;
+    use crate::species::first::compose;
 
     #[test]
     fn smf_structure() {
