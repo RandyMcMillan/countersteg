@@ -69,7 +69,16 @@ fn cmd_compose(args: &[String]) -> ExitCode {
 }
 
 fn cmd_embed(args: &[String]) -> ExitCode {
-    let seed = opt(args, "--seed").map(parse_seed).unwrap_or(0);
+    // The nonce keys the keystream and travels in the framing; it must be
+    // unique per (passphrase, message). Default: time+pid mix (uniqueness,
+    // not secrecy — that is what the passphrase is for).
+    let seed = opt(args, "--seed").map(parse_seed).unwrap_or_else(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        nanos ^ ((std::process::id() as u64) << 32)
+    });
     let min_len: usize = opt(args, "--bars").and_then(|s| s.parse().ok()).unwrap_or(16);
     let message = opt(args, "--message").unwrap_or("");
     let key = opt(args, "--key").unwrap_or("");
@@ -83,13 +92,15 @@ fn cmd_embed(args: &[String]) -> ExitCode {
     match stego::embed(message.as_bytes(), key, seed, min_len) {
         Ok((comp, len)) => {
             print_score(&comp.cf, &comp.cp);
-            let bytes = engine::write_smf_named(&comp, Some(&format!("seed:{seed}")));
+            // No track name: embedded files carry no identifying metadata.
+            let bytes = engine::write_smf_named(&comp, None);
             std::fs::write(out, bytes).expect("write midi");
             println!(
-                "embedded {} bytes ({} bits payload + framing) into {} notes -> {out}",
+                "embedded {} bytes ({} bits payload + framing) into {} notes -> {out} (nonce {})",
                 message.len(),
                 message.len() * 8,
-                len
+                len,
+                seed
             );
             ExitCode::SUCCESS
         }
@@ -117,21 +128,10 @@ fn cmd_extract(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let seed = data
-        .track_name
-        .as_deref()
-        .and_then(|n| n.strip_prefix("seed:"))
-        .and_then(|s| s.parse::<u64>().ok());
-    let seed = match seed {
-        Some(s) => s,
-        None => {
-            eprintln!("no seed found in MIDI track name");
-            return ExitCode::FAILURE;
-        }
-    };
     let cf: Vec<engine::Note> = data.cf.iter().map(|&m| engine::Note::from_midi(m).unwrap()).collect();
     let cp: Vec<engine::Note> = data.cp.iter().map(|&m| engine::Note::from_midi(m).unwrap()).collect();
-    match stego::extract(&cf, &cp, key, seed) {
+    // Framing v2: the nonce is read from the bitstream; only the key is needed.
+    match stego::extract(&cf, &cp, key) {
         Ok(msg) => {
             println!("{}", String::from_utf8_lossy(&msg));
             ExitCode::SUCCESS
