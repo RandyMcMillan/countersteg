@@ -13,6 +13,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "countersteg-wasm"
+version = "0.1.0"
+dependencies = [
+ "engine",
+ "stego",
+]
+
+[[package]]
 name = "engine"
 version = "0.1.0"
 
