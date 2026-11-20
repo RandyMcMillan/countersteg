@@ -74,8 +74,10 @@ pub extern "C" fn compose_midi(seed: u64, len: usize) -> i32 {
     ok(engine::write_smf_named(&comp, Some(&format!("seed:{seed}"))))
 }
 
-/// Embed a message. On success returns 0 and OUTPUT holds SMF bytes
-/// (seed carried in the track-name meta event).
+/// Embed a message. On success returns 0 and OUTPUT holds SMF bytes.
+/// `seed` is the per-message nonce: it keys the keystream and travels in
+/// the framing — the output file carries no identifying metadata (not even
+/// a track name). Must be unique per (passphrase, message).
 #[no_mangle]
 pub extern "C" fn embed_midi(
     msg_ptr: *const u8,
@@ -87,13 +89,14 @@ pub extern "C" fn embed_midi(
 ) -> i32 {
     let (message, passphrase) = unsafe { (input(msg_ptr, msg_len), input_string(pass_ptr, pass_len)) };
     match stego::embed(message, &passphrase, seed, min_len.max(4)) {
-        Ok((comp, _)) => ok(engine::write_smf_named(&comp, Some(&format!("seed:{seed}")))),
+        Ok((comp, _)) => ok(engine::write_smf_named(&comp, None)),
         Err(e) => fail(e.to_string()),
     }
 }
 
 /// Extract a message from SMF bytes. On success returns 0 and OUTPUT holds
-/// the plaintext message.
+/// the plaintext message. The nonce is read from the framing; only the
+/// passphrase is needed.
 #[no_mangle]
 pub extern "C" fn extract_message(
     midi_ptr: *const u8,
@@ -106,20 +109,11 @@ pub extern "C" fn extract_message(
         Ok(d) => d,
         Err(e) => return fail(e),
     };
-    let seed = match data
-        .track_name
-        .as_deref()
-        .and_then(|n| n.strip_prefix("seed:"))
-        .and_then(|s| s.parse::<u64>().ok())
-    {
-        Some(s) => s,
-        None => return fail("no seed found in MIDI track name"),
-    };
     let (cf, cp) = match cf_cp_from_midi(&data) {
         Ok(v) => v,
         Err(e) => return fail(e),
     };
-    match stego::extract(&cf, &cp, &passphrase, seed) {
+    match stego::extract(&cf, &cp, &passphrase) {
         Ok(msg) => ok(msg),
         Err(e) => fail(e.to_string()),
     }
