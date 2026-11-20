@@ -84,7 +84,7 @@ pub fn read_smf(bytes: &[u8]) -> Result<SmfData, String> {
         return Err("not a MIDI file (bad MThd)".into());
     }
     let hdr_len = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    let ntracks = u16::from_be_bytes(bytes[10..12].try_into().unwrap()) as usize;
+    let ntracks = u16::from_be_bytes(bytes[10..12].try_into().unwrap());
     if ntracks != 1 {
         return Err("expected format 0 (single track)".into());
     }
