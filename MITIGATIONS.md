@@ -40,7 +40,7 @@ flaws, P1 raises attack cost, P2 closes statistical holes, P3 adds robustness.
 
 ## Mitigations
 
-### P0 — design fixes (crates `keys`, `stego`, `wasm`, web, CLI)
+### P0 — design fixes (crates `keys`, `stego`, `wasm`, web, CLI) — IMPLEMENTED
 
 - **M1 (A1, A4, A7): remove the seed from the cover entirely.**
   - Framing becomes `[8-byte nonce][u8 len][ciphertext][16-byte tag]`.
@@ -78,7 +78,7 @@ dev-deps are unaffected (they test SHA-256 and xoroshiro as primitives). The
 WASM FFI signatures for `embed_midi`/`extract_message` change; `web/app.js`
 and the CLI follow.
 
-### P1 — cost-raising and hygiene
+### P1 — cost-raising and hygiene — IMPLEMENTED
 
 - **M5 (A5):** document passphrase entropy requirements (>= 80 bits) in README
   and the web UI; refuse obviously weak passphrases in the CLI (length +
@@ -119,13 +119,23 @@ and the CLI follow.
   nonces. M7 is done when the warden's own test cannot separate embedded
   from natural.
 
-### P3 — robustness (optional)
+### P3 — robustness (implemented)
 
-- **M9 (A6 residual):** error correction for the active-warden case — simple
-  3x repetition coding first (zero-dep), Reed-Solomon later if capacity
-  budget allows.
-- **M10:** multi-file consensus — split a message across several scores so no
-  single file carries the whole plaintext.
+- **M9 (A6 residual): error correction — IMPLEMENTED (`embed_with_ecc`).**
+  The framed region is triplicated as `[0x02][region x3]`; extraction
+  majority-votes the three copies, correcting any single-byte corruption of
+  the payload integer before the MAC is checked. The 0x02 marker is detected
+  on decode, so ECC and non-ECC files interoperate transparently. Costs 3x
+  capacity — the message cap drops to 64 bytes to keep the embed extension
+  budget sufficient. Reed-Solomon remains a later option if the capacity
+  budget grows.
+- **M10: multi-file consensus — IMPLEMENTED (`embed_split` / `extract_join`).**
+  A message is sharded across `count` compositions; each shard embeds
+  `[index][total][len][chunk]` through the normal single-file path (per-shard
+  nonce `base + i`), so no single file carries the whole plaintext and the
+  255-byte cap no longer bounds the message. Reassembly requires every shard
+  exactly once with consistent totals — a withheld or substituted shard is
+  detectable.
 
 ## Prior art anchoring
 
