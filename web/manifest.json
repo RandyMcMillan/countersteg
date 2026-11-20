@@ -1,0 +1,25 @@
+{
+  "name": "countersteg — musical steganography studio",
+  "short_name": "countersteg",
+  "description": "Hide messages in genuinely Fuxian counterpoint. Compose, embed, extract, and play — all client-side.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
