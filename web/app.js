@@ -70,8 +70,17 @@ async function extractMessage(midiBytes, passphrase) {
 
 // --- Player: the Rust synth renders SMF -> f32 PCM; JS just plays it ---
 
-let player = null;
+let player = null;   // { ctx, src }
+let audioCtx = null; // shared context — never closed (iOS handles closed contexts poorly)
 const last = { compose: null, embed: null, extract: null };
+
+function getCtx() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new AC();
+  }
+  return audioCtx;
+}
 
 async function renderAudio(midiBytes, sampleRate) {
   await loadWasm();
@@ -84,13 +93,11 @@ async function renderAudio(midiBytes, sampleRate) {
 function stopMidi() {
   if (!player) return;
   try { player.src.stop(); } catch (_) { /* already ended */ }
-  player.ctx.close();
   player = null;
 }
 
-async function playMidi(midiBytes, onEnd) {
+async function playMidi(ctx, midiBytes, onEnd) {
   stopMidi();
-  const ctx = new AudioContext();
   const data = await renderAudio(midiBytes, ctx.sampleRate);
   const buf = ctx.createBuffer(1, data.length, ctx.sampleRate);
   buf.copyToChannel(data, 0);
@@ -98,7 +105,7 @@ async function playMidi(midiBytes, onEnd) {
   src.buffer = buf;
   src.connect(ctx.destination);
   src.onended = () => {
-    if (player && player.src === src) { player.ctx.close(); player = null; }
+    if (player && player.src === src) player = null;
     if (onEnd) onEnd();
   };
   src.start();
@@ -116,7 +123,13 @@ async function togglePlay(btn, key) {
   btn.textContent = 'Rendering…';
   btn.disabled = true;
   try {
-    await playMidi(bytes, () => { btn.textContent = 'Play'; });
+    // iOS Safari: the AudioContext must be unlocked by THIS user gesture and
+    // be in 'running' state before src.start(); otherwise the status bar
+    // shows the speaker icon but nothing is audible. Resume inside the click.
+    const ctx = getCtx();
+    if (ctx.state === 'suspended') await ctx.resume();
+    await playMidi(ctx, bytes, () => { btn.textContent = 'Play'; });
+    if (ctx.state === 'suspended') await ctx.resume();
     btn.textContent = 'Stop';
   } catch (e) {
     btn.textContent = 'Play';

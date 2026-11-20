@@ -220,3 +220,70 @@ pub extern "C" fn render_midi(midi_ptr: *const u8, midi_len: usize, sample_rate:
     }
     ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Native (non-wasm) tests — run by `cargo test --workspace`, which the
+    //! Pages workflow already executes. They verify the synth output the
+    //! browser player depends on (length, audibility, determinism) so a
+    //! regression that produces silent PCM fails CI instead of shipping.
+    use super::*;
+    use std::sync::Mutex;
+
+    /// OUTPUT is a single shared buffer; tests must not call render_midi
+    /// concurrently or one test's output frees another's view of it.
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    fn smf(seed: u64, len: usize) -> Vec<u8> {
+        engine::write_smf_named(&engine::compose(seed, len), Some("render-test"))
+    }
+
+    fn render(bytes: &[u8], sample_rate: u32) -> Vec<f32> {
+        let _g = LOCK.lock().unwrap();
+        let p = alloc(bytes.len());
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
+        let rc = render_midi(p, bytes.len(), sample_rate);
+        dealloc(p, bytes.len());
+        assert_eq!(rc, 0, "render_midi failed: {:?}", unsafe {
+            String::from_utf8_lossy(slice::from_raw_parts(output_ptr(), output_len()))
+        });
+        let out = unsafe { slice::from_raw_parts(output_ptr(), output_len()) };
+        out.chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn render_produces_non_silent_finite_pcm() {
+        // 8 whole notes at 120 bpm = 16s + 0.5s ring-out tail
+        let pcm = render(&smf(42, 8), 44_100);
+        let expect = (16.5 * 44_100.0) as usize;
+        assert!(
+            (pcm.len() as isize - expect as isize).abs() < 64,
+            "sample count {} vs expected {expect}",
+            pcm.len()
+        );
+        assert!(pcm.iter().all(|s| s.is_finite()), "non-finite sample");
+        let peak = pcm.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(peak > 0.1, "PCM is silent (peak {peak})");
+        assert!(peak <= 1.0, "PCM exceeds full scale (peak {peak})");
+    }
+
+    #[test]
+    fn render_is_deterministic() {
+        let a = render(&smf(7, 8), 22_050);
+        let b = render(&smf(7, 8), 22_050);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn render_rejects_garbage_input() {
+        let junk = [0xdeu8, 0xad, 0xbe, 0xef];
+        let p = alloc(junk.len());
+        unsafe { std::ptr::copy_nonoverlapping(junk.as_ptr(), p, junk.len()) };
+        let rc = render_midi(p, junk.len(), 44_100);
+        dealloc(p, junk.len());
+        assert_eq!(rc, 1);
+        assert_eq!(is_error(), 1);
+    }
+}
