@@ -7,6 +7,26 @@
 //! The v2 schedule replaces the v1 xoroshiro128++ keystream (a
 //! non-cryptographic PRNG vulnerable to state recovery from known output)
 //! and the 1-byte MAC (1/256 forgery odds). See MITIGATIONS.md (M2, M3).
+//!
+//! Integrity properties (confirmed audit, 2026-11):
+//!
+//! - Encrypt-then-MAC: the tag is computed over the ciphertext, so the
+//!   MAC check doubles as a padding oracle-safe authenticity gate before
+//!   any decryption happens. Truncation to 128 bits gives 2^-128 forgery
+//!   odds; the construction is `SHA-256(domain || key || data)`, which is
+//!   HMAC-style prefix-MAC — fine for this fixed domain separation, and
+//!   the tag is never used as a raw hash output, so length-extension does
+//!   not apply.
+//! - Nonce misuse resistance: `derive_key` binds the nonce, so nonce
+//!   reuse under the same passphrase is the caller's responsibility
+//!   (random per message is the documented default). A nonce collision
+//!   reuses a keystream — the classic two-time-pad — but no longer leaks
+//!   via a recomputable cover (M1) or PRNG state recovery (M2).
+//! - The MAC comparison in `stego::extract_with_key` is not constant-time
+//!   (array `!=`). Accepted: extraction is local-only, the threat model
+//!   (MITIGATIONS.md) is an offline warden over published files, not a
+//!   timing oracle on a live endpoint. Documented here so a future
+//!   network-facing use re-evaluates it.
 
 /// SHA-256 digest of `parts`.
 pub fn sha256(parts: &[&[u8]]) -> [u8; 32] {
