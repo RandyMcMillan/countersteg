@@ -2,3 +2,11 @@
 name = "countersteg"
 version = "0.1.0"
 edition = "2021"
+description = "Generative music steganography studio CLI"
+license = "MIT"
+
+[dependencies]
+engine = { path = "../engine" }
+stego = { path = "../stego" }
+entropy = { path = "../entropy" }
+keys = { path = "../keys" }

@@ -4,22 +4,55 @@ Generative music steganography studio. A Markov–counterpoint hybrid engine com
 valid first-species polyphony; hidden payloads ride the *musical selection channel*
 (which notes the generator chooses), so a composed score is also a ciphertext.
 
-Derived from the randymcmillan gist corpus (Markov-Counterpoint.rs, HighlightStego.rs,
-std_stego.rs, entropy_payload.rs, Xoroshiro128PlusPlus.rs, nist_800-90b.rs).
+Derived from the randymcmillan gist corpus (Markov-Counterpoint.rs, entropy_payload.rs,
+Xoroshiro128PlusPlus.rs, nist_800-90b.rs, faux_hmac.rs).
+
+## How it works
+
+1. **Compose**: a weighted Markov random walk generates a cantus firmus; a
+   first-species counterpoint voice is added under Fuxian rules (consonant
+   intervals only, no parallel/hidden perfects, perfect consonances at start/end,
+   imperfect penultimate, leap-follow rule).
+2. **Embed**: at every decision point where `arity` rule-valid candidates exist,
+   `floor(log2(arity))` payload bits pick the continuation. The channel is lossless
+   because `2^n <= arity`, so the chosen index *is* the payload bits.
+3. **Cipher first**: the message is framed as `[u8 length][keystream-XOR body][MAC tag]`
+   (SHA-256 key schedule -> xoroshiro128++ keystream) before touching the channel,
+   so the channel bitstream looks random.
+4. **Extract**: candidate generation is replayed against the notes in the MIDI
+   file; the index of each taken note recovers the bits. No seed file needed —
+   the seed travels in the MIDI track-name meta event.
+
+Capacity is ~2.8 bits per whole note (~0.35 bytes/note); `embed` auto-extends
+the score until the payload fits.
 
 ## Layout
 
-- `crates/engine` — Markov chain + Fuxian first-species counterpoint composer, MIDI export
-- `crates/stego` — selection-channel encode/decode over composer decision points
-- `crates/entropy` — xoroshiro128++ keystream, Shannon entropy, health stats
-- `crates/keys` — passphrase key schedule (SHA-256), pre-cipher layer
-- `crates/cli` — `countersteg` binary: compose / embed / extract / stats
+- `crates/engine` — composer, rules, dependency-free SMF read/write
+- `crates/stego` — selection-channel encode/decode, bitstream framing
+- `crates/entropy` — xoroshiro128++ keystream, Shannon entropy, uniformity
+- `crates/keys` — SHA-256 key schedule, MAC tag
+- `crates/cli` — `countersteg` binary
 
 ## Usage
 
+```sh
+countersteg compose --seed 42 --bars 16 --out plain.mid
+countersteg embed   --seed 42 --message "attack at dawn" --key s3cret --out stego.mid
+countersteg extract --in stego.mid --key s3cret
+countersteg stats   --in stego.mid
 ```
-countersteg compose  --seed 42 --bars 16 --out plain.mid
-countersteg embed    --seed 42 --bars 16 --message "hello" --key pass --out stego.mid
-countersteg extract  --in stego.mid --key pass
-countersteg stats    --in stego.mid
+
+## Tests
+
+```sh
+cargo test --workspace   # 29 tests: rules, roundtrips, wrong-key, CLI e2e
 ```
+
+## Roadmap (from the gist-corpus plan)
+
+- M5: statistical distinguishability panel (NIST 800-90b battery over scores
+  with/without payload)
+- M6: SVG-filter delivery channel (HighlightStego.rs), HTML bundle
+- M7: WASM build + web UI; desktop shell via wry/tauri
+- Optional anchor: signet OP_RETURN timestamping + Sigma-protocol receipt
