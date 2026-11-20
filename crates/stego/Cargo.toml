@@ -2,3 +2,10 @@
 name = "stego"
 version = "0.1.0"
 edition = "2021"
+description = "Selection-channel steganography over composer decision points"
+license = "MIT"
+
+[dependencies]
+engine = { path = "../engine" }
+entropy = { path = "../entropy" }
+keys = { path = "../keys" }
