@@ -142,3 +142,81 @@ pub extern "C" fn output_len() -> usize {
 pub extern "C" fn is_error() -> i32 {
     unsafe { FAILED as i32 }
 }
+
+// --- Built-in player: render SMF to mono f32 PCM (little-endian) ---
+
+/// Tempo and timing constants matching `engine::midi::write_smf_named`
+/// (500000 µs per quarter, 480 ticks per quarter, whole notes).
+const TEMPO_US: u32 = 500_000;
+const TPQ: u32 = 480;
+
+/// Add one synthesized note into `buf` at `start` (sample index).
+fn synth_note(buf: &mut [f32], start: usize, dur: usize, midi: u8, voice: u8, sr: f64) {
+    let freq = 440.0 * 2f64.powf((midi as f64 - 69.0) / 12.0);
+    let amp = if voice == 0 { 0.30 } else { 0.20 };
+    let attack = (0.015 * sr) as usize;
+    let release = (0.12 * sr) as usize;
+    let end = (start + dur + release).min(buf.len());
+    for i in start..end {
+        let age = i - start;
+        let env = if age < attack {
+            age as f64 / attack as f64
+        } else if age > dur {
+            (1.0 - (age - dur) as f64 / release as f64).max(0.0)
+        } else {
+            1.0
+        };
+        let t = age as f64 / sr;
+        let phase = freq * t;
+        // CF (voice 0): triangle, piano-ish. CP (voice 1): band-limited saw.
+        let v = if voice == 0 {
+            let x = phase - (phase + 0.5).floor(); // -0.5..0.5
+            4.0 * x.abs() - 1.0
+        } else {
+            let mut s = 0.0;
+            for k in 1..=4 {
+                s += (2.0 * std::f64::consts::PI * k as f64 * phase).sin() / k as f64;
+            }
+            s * 0.55
+        };
+        buf[i] = (buf[i] as f64 + amp * env * v) as f32;
+    }
+}
+
+/// Render a countersteg SMF to mono f32 PCM at `sample_rate` Hz.
+/// On success returns 0 and OUTPUT holds `4 * n` little-endian f32 bytes.
+#[no_mangle]
+pub extern "C" fn render_midi(midi_ptr: *const u8, midi_len: usize, sample_rate: u32) -> i32 {
+    let bytes = unsafe { input(midi_ptr, midi_len) };
+    let data = match engine::read_smf(bytes) {
+        Ok(d) => d,
+        Err(e) => return fail(e),
+    };
+    let (cf, cp) = match cf_cp_from_midi(&data) {
+        Ok(v) => v,
+        Err(e) => return fail(e),
+    };
+    let sr = (sample_rate.clamp(4_000, 192_000)) as f64;
+    let spb = TEMPO_US as f64 / 1e6 / TPQ as f64; // seconds per tick
+    let note_ticks = engine::TICKS_PER_NOTE as f64;
+    let total = cf.len().max(cp.len()) as f64 * note_ticks * spb;
+    let tail = 0.5; // ring-out
+    let n = (total * sr) as usize + (tail * sr) as usize;
+    let mut buf = vec![0f32; n];
+    let note_samples = (note_ticks * spb * sr) as usize;
+    for (i, note) in cf.iter().enumerate() {
+        synth_note(&mut buf, (i as f64 * note_ticks * spb * sr) as usize, note_samples, note.midi(), 0, sr);
+    }
+    for (i, note) in cp.iter().enumerate() {
+        synth_note(&mut buf, (i as f64 * note_ticks * spb * sr) as usize, note_samples, note.midi(), 1, sr);
+    }
+    // soft clip to [-1, 1]
+    for s in buf.iter_mut() {
+        *s = s.tanh();
+    }
+    let mut out = Vec::with_capacity(buf.len() * 4);
+    for s in buf {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    ok(out)
+}

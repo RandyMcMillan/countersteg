@@ -68,6 +68,63 @@ async function extractMessage(midiBytes, passphrase) {
   return dec.decode(readOutput());
 }
 
+// --- Player: the Rust synth renders SMF -> f32 PCM; JS just plays it ---
+
+let player = null;
+const last = { compose: null, embed: null, extract: null };
+
+async function renderAudio(midiBytes, sampleRate) {
+  await loadWasm();
+  const [ip, il] = writeBytes(midiBytes);
+  if (ex.render_midi(ip, il, sampleRate | 0) !== 0) throw new Error(readError());
+  const pcm = readOutput();
+  return new Float32Array(pcm.buffer, pcm.byteOffset, pcm.length / 4).slice();
+}
+
+function stopMidi() {
+  if (!player) return;
+  try { player.src.stop(); } catch (_) { /* already ended */ }
+  player.ctx.close();
+  player = null;
+}
+
+async function playMidi(midiBytes, onEnd) {
+  stopMidi();
+  const ctx = new AudioContext();
+  const data = await renderAudio(midiBytes, ctx.sampleRate);
+  const buf = ctx.createBuffer(1, data.length, ctx.sampleRate);
+  buf.copyToChannel(data, 0);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  src.onended = () => {
+    if (player && player.src === src) { player.ctx.close(); player = null; }
+    if (onEnd) onEnd();
+  };
+  src.start();
+  player = { ctx, src };
+}
+
+async function togglePlay(btn, key) {
+  if (player) {
+    stopMidi();
+    btn.textContent = 'Play';
+    return;
+  }
+  const bytes = last[key];
+  if (!bytes) return;
+  btn.textContent = 'Rendering…';
+  btn.disabled = true;
+  try {
+    await playMidi(bytes, () => { btn.textContent = 'Play'; });
+    btn.textContent = 'Stop';
+  } catch (e) {
+    btn.textContent = 'Play';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function download(bytes, name) {
   const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/midi' }));
   const a = document.createElement('a');
@@ -104,6 +161,8 @@ document.getElementById('btn-compose').addEventListener('click', async (ev) => {
   try {
     const seed = document.getElementById('c-seed').value;
     const midi = await composeMidi(seed, document.getElementById('c-bars').value);
+    last.compose = midi;
+    document.getElementById('play-compose').disabled = false;
     const el = show('out-compose', 'ok', download(midi, `countersteg-compose-${seedName(seed)}.mid`));
     el.append(`\n${midi.length} bytes SMF (seed:${seed})`);
   } catch (e) {
@@ -126,11 +185,23 @@ document.getElementById('btn-embed').addEventListener('click', async (ev) => {
     );
     const el = show('out-embed', 'ok', download(midi, `countersteg-embed-${seedName(seed)}.mid`));
     el.append(`\n${msg.length} bytes hidden in ${midi.length} bytes of counterpoint (seed:${seed})`);
+    last.embed = midi;
+    document.getElementById('play-embed').disabled = false;
   } catch (e) {
     show('out-embed', 'bad', e.message);
   } finally {
     ev.target.disabled = false;
   }
+});
+
+document.getElementById('x-file').addEventListener('change', async () => {
+  const file = document.getElementById('x-file').files[0];
+  document.getElementById('play-extract').disabled = !file;
+  last.extract = file ? new Uint8Array(await file.arrayBuffer()) : null;
+});
+
+['compose', 'embed', 'extract'].forEach((k) => {
+  document.getElementById(`play-${k}`).addEventListener('click', (ev) => togglePlay(ev.target, k));
 });
 
 document.getElementById('btn-extract').addEventListener('click', async (ev) => {

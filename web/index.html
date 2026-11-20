@@ -42,6 +42,10 @@
     padding: 10px 20px; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer;
   }
   button.go:disabled { opacity: 0.4; cursor: default; }
+  button.go.ghost {
+    background: transparent; color: var(--accent);
+    border: 1px solid var(--accent); margin-left: 8px;
+  }
   .out {
     margin-top: 16px; padding: 12px; border-radius: 8px; font-size: 14px;
     background: var(--bg); border: 1px solid var(--border); white-space: pre-wrap;
@@ -71,6 +75,7 @@
       <div><label for="c-bars">Whole notes</label><input type="number" id="c-bars" value="16" min="4" max="512"></div>
     </div>
     <button class="go" id="btn-compose">Compose MIDI</button>
+    <button class="go ghost" id="play-compose" disabled>Play</button>
     <div class="out" id="out-compose"></div>
   </section>
 
@@ -83,6 +88,7 @@
       <div><label for="e-bars">Min notes</label><input type="number" id="e-bars" value="16" min="4" max="512"></div>
     </div>
     <button class="go" id="btn-embed">Embed &amp; download MIDI</button>
+    <button class="go ghost" id="play-embed" disabled>Play</button>
     <div class="out" id="out-embed"></div>
   </section>
 
@@ -93,6 +99,7 @@
       <div><label for="x-pass">Passphrase</label><input type="password" id="x-pass" value="s3cret"></div>
     </div>
     <button class="go" id="btn-extract">Extract message</button>
+    <button class="go ghost" id="play-extract" disabled>Play</button>
     <div class="out" id="out-extract"></div>
   </section>
 
