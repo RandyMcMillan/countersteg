@@ -1,0 +1,13 @@
+[package]
+name = "countersteg-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-dependency WASM bindings (raw FFI) for the countersteg engine"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+engine = { path = "../engine" }
+stego = { path = "../stego" }
