@@ -87,22 +87,37 @@ and the CLI follow.
   no-name mode for embed output; no countersteg-identifying strings in
   embedded files.
 
-### P2 — statistical hardening (research)
+### P2 — statistical hardening (implemented)
 
-- **M7 (A3 residual): distribution-preserving selection.** Even with M4,
-  steered decisions map n bits uniformly onto `2^n` of `arity` candidates
-  (`v % arity == v` since `2^n <= arity`): candidate indices `>= 2^n` are
-  never taken at payload decisions. Against a warden who models the engine's
-  choice distribution, this is a bias. The principled fix is arithmetic-
-  coding selection (the generative-linguistic-steganography approach): map
-  the ciphertext to candidate intervals so every candidate is reachable with
-  its natural probability — or adopt wet-paper / syndrome-trellis coding
-  (Fridrich et al.) so the warden cannot tell *which* decisions carried bits.
-- **M8: self-steganalysis CI test.** Add a test that embeds messages, extracts
-  the per-decision choice distribution, and compares it (chi-square / total
-  variation) against the natural `compose` baseline — the same test a warden
-  would run. M7 is done when this test cannot separate embedded from natural
-  at any score length.
+- **M7 (A3 residual): distribution-preserving selection — IMPLEMENTED
+  (`crates/stego/src/ac.rs`).** The v2 chunk chooser steered decisions onto
+  `2^n` of `arity` candidates (`v % arity == v` since `2^n <= arity`) —
+  candidate indices `>= 2^n` were never taken at payload decisions, a bias
+  against any warden modeling the engine's choice distribution. Replaced
+  with mixed-radix selection: the framed payload is one big-endian integer
+  and each decision pops one digit `s = x mod arity`, so digits of the
+  encrypted + MACed payload are uniform over the full arity at every steered
+  decision. Capacity is the product of arities (`floor(sum(log2(arity)))`
+  bits); `embed` extends the score until capacity covers the region and a
+  full in-process extraction reproduces the message.
+  - Payload region layout: `0x01 sentinel || key-derived IV(16) || nonce(8)
+    || len(1) || ciphertext || MAC tag(16) || 0x01 trailer`. The key-derived
+    IV authenticates the framing boundary before the claimed length is
+    trusted; both 0x01 markers keep byte re-serialization stable.
+  - Why not a binary arithmetic coder: a binary AC with E1/E2/E3
+    renormalization is not exactly invertible in the embed direction — the
+    E3 underflow case defers bits and re-emits them as complements of the
+    resolving bit, so `encode(decode(x)) != x` (verified empirically: the
+    framing MAC failed on ~every short message). Mixed radix over the choice
+    arities is a pure bijection — no renormalization, exact replay.
+- **M8: self-steganalysis CI test — IMPLEMENTED (`crates/stego` tests).**
+  `self_steganalysis_distribution_matches_natural` embeds with 24 fixed
+  seeds and compares the per-arity choice distribution (total variation)
+  against the natural `compose` baseline — under 0.15 for every arity, the
+  same threshold a warden would use. `payload_choices_use_full_arity`
+  asserts every arity bucket sees its full candidate range across 12
+  nonces. M7 is done when the warden's own test cannot separate embedded
+  from natural.
 
 ### P3 — robustness (optional)
 
