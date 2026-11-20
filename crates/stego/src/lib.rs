@@ -333,6 +333,22 @@ mod tests {
     }
 
     #[test]
+    fn embedded_file_carries_no_identifying_metadata() {
+        // M6 regression: embedded files must be indistinguishable from plain
+        // MIDI — no track name, no countersteg-identifying byte strings.
+        let (comp, _) = embed(b"metadata probe", "pw", 11, 16).unwrap();
+        let bytes = engine::write_smf_named(&comp, None);
+        let data = engine::read_smf(&bytes).unwrap();
+        assert!(data.track_name.is_none(), "embedded file must not carry a track name");
+        for marker in [b"countersteg".as_slice(), b"Countersteg", b"seed:", b"nonce"] {
+            let found = bytes
+                .windows(marker.len())
+                .any(|w| w.eq_ignore_ascii_case(marker));
+            assert!(!found, "embedded file contains identifying marker {marker:?}");
+        }
+    }
+
+    #[test]
     fn channel_choices_match_payload_bits() {
         // Encoder invariant: at payload (framing) decisions the choice is
         // the steered bits, so choice < 2^n. Tail decisions are driven by
