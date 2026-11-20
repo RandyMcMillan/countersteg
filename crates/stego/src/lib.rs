@@ -66,7 +66,7 @@ pub enum StegoError {
 }
 
 impl std::fmt::Display for StegoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StegoError::CapacityExceeded { needed_bits, capacity_bits } => write!(
                 f,
