@@ -55,6 +55,26 @@ fn opt<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .map(|w| w[1].as_str())
 }
 
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
+}
+
+/// Why a passphrase is too weak to embed with, or None if acceptable.
+/// MITIGATIONS.md M5: the 100k-round stretch slows offline guessing but
+/// cannot stop it — passphrase entropy is the only real defense. This is a
+/// floor, not a strength meter: 12+ chars with 6+ distinct characters.
+fn passphrase_weakness(p: &str) -> Option<&'static str> {
+    let len = p.chars().count();
+    let unique = p.chars().collect::<std::collections::BTreeSet<_>>().len();
+    if len < 12 {
+        Some("shorter than 12 characters")
+    } else if unique < 6 {
+        Some("fewer than 6 distinct characters")
+    } else {
+        None
+    }
+}
+
 fn cmd_compose(args: &[String]) -> ExitCode {
     let seed = opt(args, "--seed").map(parse_seed).unwrap_or(0);
     let bars: usize = opt(args, "--bars").and_then(|s| s.parse().ok()).unwrap_or(16);
@@ -82,6 +102,19 @@ fn cmd_embed(args: &[String]) -> ExitCode {
     let min_len: usize = opt(args, "--bars").and_then(|s| s.parse().ok()).unwrap_or(16);
     let message = opt(args, "--message").unwrap_or("");
     let key = opt(args, "--key").unwrap_or("");
+    // M5: refuse obviously weak passphrases at embed time. Extraction keeps
+    // accepting anything (the sender chose the key; guessing cost is the
+    // attacker's problem). --allow-weak-key is for demos/tests only.
+    if !has_flag(args, "--allow-weak-key") {
+        if let Some(why) = passphrase_weakness(key) {
+            eprintln!(
+                "refusing weak passphrase ({why}); the 100k-round stretch slows offline\n\
+                 guessing but entropy is the only real defense — use 12+ characters with\n\
+                 6+ distinct characters (pass --allow-weak-key to override for demos)"
+            );
+            return ExitCode::from(2);
+        }
+    }
     let out = match opt(args, "--out") {
         Some(o) => o,
         None => {
