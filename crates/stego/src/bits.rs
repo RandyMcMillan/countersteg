@@ -68,6 +68,10 @@ impl<'a> BitReader<'a> {
     pub fn remaining(&self) -> usize {
         self.bytes.len() * 8 - self.bitpos
     }
+
+    pub fn consumed(&self) -> usize {
+        self.bitpos
+    }
 }
 
 #[cfg(test)]
