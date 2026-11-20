@@ -2,3 +2,5 @@
 name = "entropy"
 version = "0.1.0"
 edition = "2021"
+description = "Keystream PRNG, Shannon entropy, stream health stats"
+license = "MIT"
