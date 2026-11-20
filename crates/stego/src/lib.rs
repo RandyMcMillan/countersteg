@@ -49,6 +49,25 @@
 //!
 //! The pre-cipher (keys crate, v2 schedule) runs before channel encoding, so
 //! the payload integer is computationally indistinguishable from random.
+//!
+//! Integrity chain on extract (order matters — each check gates the next):
+//!
+//! 1. `parse_region` checks both 0x01 markers and that
+//!    `MIN_REGION + claimed <= bytes.len()`, so every later slice is
+//!    in-bounds; failure is indistinguishable from a wrong key.
+//! 2. The key-derived IV check authenticates the framing boundary with the
+//!    full 128-bit security of SHA-256 before `claimed` is used as a
+//!    length — a wrong key, tampered region, or non-countersteg file is
+//!    rejected here, never on an out-of-bounds slice.
+//! 3. The 16-byte MAC (Encrypt-then-MAC over the ciphertext body) catches
+//!    any remaining tampering of nonce/len/body with ~2^-128 false-accept.
+//!    The nonce and len fields are protected transitively: the nonce feeds
+//!    key derivation, so flipping it changes the key and fails check 2;
+//!    flipping `len` moves the body/tag window and fails the MAC.
+//!
+//! M9 note: ECC majority-vote runs *before* all of this, so single-byte
+//! corruption is repaired while multi-byte corruption still fails closed
+//! at the MAC rather than decoding garbage.
 
 use engine::{compose_with, decisions_of, Chooser, Composition, Decision, Note};
 
