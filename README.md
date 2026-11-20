@@ -16,22 +16,27 @@ Xoroshiro128PlusPlus.rs, nist_800-90b.rs, faux_hmac.rs).
 2. **Embed**: at every decision point where `arity` rule-valid candidates exist,
    `floor(log2(arity))` payload bits pick the continuation. The channel is lossless
    because `2^n <= arity`, so the chosen index *is* the payload bits.
-3. **Cipher first**: the message is framed as `[u8 length][keystream-XOR body][MAC tag]`
-   (SHA-256 key schedule -> xoroshiro128++ keystream) before touching the channel,
-   so the channel bitstream looks random.
+3. **Cipher first**: the message is framed as `[nonce le64][u8 length][keystream-XOR body][16-byte MAC tag]`
+   (SHA-256 key schedule with 100k-round stretching -> SHA-256-CTR keystream)
+   before touching the channel, so the channel bitstream looks random. The
+   nonce keys the keystream and travels in the framing, so reusing a
+   passphrase across messages never reuses a keystream.
 4. **Extract**: candidate generation is replayed against the notes in the MIDI
-   file; the index of each taken note recovers the bits. No seed file needed —
-   the seed travels in the MIDI track-name meta event.
+   file; the index of each taken note recovers the bits. Only the passphrase
+   is needed — the nonce is read back from the framing, and embedded files
+   carry no identifying metadata. Once the framing is consumed, generation
+   falls back to the engine's own PRNG, so the score's tail is distributed
+   exactly like a natural composition.
 
 Capacity is ~2.8 bits per whole note (~0.35 bytes/note); `embed` auto-extends
-the score until the payload fits.
+the score until the payload fits exactly on a decision boundary.
 
 ## Layout
 
 - `crates/engine` — composer, rules, dependency-free SMF read/write
 - `crates/stego` — selection-channel encode/decode, bitstream framing
-- `crates/entropy` — xoroshiro128++ keystream, Shannon entropy, uniformity
-- `crates/keys` — SHA-256 key schedule, MAC tag
+- `crates/entropy` — xoroshiro128++ (tested against rand_xoshiro), Shannon entropy, uniformity
+- `crates/keys` — SHA-256, v2 key schedule (stretching), SHA-256-CTR keystream, 128-bit MAC
 - `crates/cli` — `countersteg` binary
 - `crates/wasm` — zero-dependency `wasm32-unknown-unknown` bindings (raw FFI,
   no wasm-bindgen): `compose_midi` / `embed_midi` / `extract_message`
