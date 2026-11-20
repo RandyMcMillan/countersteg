@@ -25,6 +25,17 @@
 //! The key-derived IV authenticates the framing boundary before the claimed
 //! length is trusted: a wrong key fails here, not on a length check.
 //!
+//! M9 error correction (active-warden case): `embed_with_ecc` wraps the
+//! region as `[0x02][region x3]` — extraction majority-votes the three
+//! copies, so any single-byte corruption of the payload integer is
+//! corrected before the MAC is checked. The 0x02 marker is detected on
+//! decode, so ECC and non-ECC files interoperate transparently.
+//!
+//! M10 multi-file consensus: `embed_split` shards a message across several
+//! compositions (each shard's payload is `[index][total][len][chunk]`), so
+//! no single file carries the whole plaintext; `extract_join` reassembles
+//! them, requiring every shard exactly once.
+//!
 //! Once the payload integer is exhausted, its remaining most-significant
 //! mixed-radix digits are 0 and late decisions take candidate 0 — at most a
 //! byte's worth of decisions at the very end of the score, far inside the
@@ -99,6 +110,12 @@ pub const HEADER_BYTES: usize = 1 + IV_BYTES;
 /// smallest possible region: header + nonce + len + tag + trailer.
 pub const MIN_REGION: usize = HEADER_BYTES + NONCE_BYTES + LEN_BYTES + TAG_BYTES + 1;
 
+/// M9: marks a triplicated region `[0x02][region x3]`; decode majority-votes.
+pub const EC_SENTINEL: u8 = 0x02;
+/// ECC triples the region, so the message cap shrinks to keep the embed
+/// extension budget (128 x 8 notes) sufficient.
+pub const EC_MAX_MESSAGE: usize = 64;
+
 /// Region size in bits for a message of `msg_len` bytes.
 pub fn framing_bits(msg_len: usize) -> usize {
     (HEADER_BYTES + NONCE_BYTES + LEN_BYTES + TAG_BYTES + msg_len + 1) * 8
@@ -121,6 +138,38 @@ fn build_framed(message: &[u8], key: &[u8; 32], nonce: u64) -> Vec<u8> {
     framed.extend_from_slice(&tag);
     framed.push(TRAILER);
     framed
+}
+
+/// M9: `[0x02][region x3]` — three copies of the framed region. Decoding
+/// majority-votes byte-wise, correcting any single copy's corruption.
+fn build_framed_ec(message: &[u8], key: &[u8; 32], nonce: u64) -> Vec<u8> {
+    let region = build_framed(message, key, nonce);
+    let mut out = Vec::with_capacity(1 + 3 * region.len());
+    out.push(EC_SENTINEL);
+    for _ in 0..3 {
+        out.extend_from_slice(&region);
+    }
+    out
+}
+
+/// M9: strip the triplication marker if present. With three copies a
+/// majority always exists (pigeonhole): if copy A disagrees with both
+/// others, copies B and C must agree with each other.
+fn unwrap_ec(bytes: &[u8]) -> Result<Vec<u8>, StegoError> {
+    if bytes.first() != Some(&EC_SENTINEL) {
+        return Ok(bytes.to_vec());
+    }
+    let rest = &bytes[1..];
+    if rest.is_empty() || rest.len() % 3 != 0 {
+        return Err(StegoError::Decode("corrupt triplicated region".into()));
+    }
+    let n = rest.len() / 3;
+    let (a, b, c) = (&rest[..n], &rest[n..2 * n], &rest[2 * n..]);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(if a[i] == b[i] || a[i] == c[i] { a[i] } else { b[i] });
+    }
+    Ok(out)
 }
 
 /// Capacity of a decision path in bits: `floor(sum(log2(arity)))` over the
@@ -190,14 +239,47 @@ pub fn embed(
     nonce: u64,
     min_len: usize,
 ) -> Result<(Composition, usize), StegoError> {
-    if message.len() > 255 {
-        return Err(StegoError::Decode("message exceeds 255 bytes".into()));
+    embed_inner(message, passphrase, nonce, min_len, false)
+}
+
+/// M9: like `embed`, but the region is triplicated so that extraction
+/// survives any single-byte corruption of the payload integer (majority
+/// vote). Costs 3x capacity; message cap is `EC_MAX_MESSAGE` (64 bytes).
+pub fn embed_with_ecc(
+    message: &[u8],
+    passphrase: &str,
+    nonce: u64,
+    min_len: usize,
+) -> Result<(Composition, usize), StegoError> {
+    embed_inner(message, passphrase, nonce, min_len, true)
+}
+
+fn embed_inner(
+    message: &[u8],
+    passphrase: &str,
+    nonce: u64,
+    min_len: usize,
+    ecc: bool,
+) -> Result<(Composition, usize), StegoError> {
+    let max_msg = if ecc { EC_MAX_MESSAGE } else { 255 };
+    if message.len() > max_msg {
+        return Err(StegoError::Decode(format!(
+            "message exceeds {max_msg} bytes"
+        )));
     }
-    let needed = framing_bits(message.len());
+    let needed = if ecc {
+        (1 + 3 * (MIN_REGION + message.len())) * 8
+    } else {
+        framing_bits(message.len())
+    };
     // Derive once: stretching is ~100k SHA-256 rounds and the loop below
     // may try many score lengths.
     let key = keys::derive_key(passphrase, nonce);
-    let framed = build_framed(message, &key, nonce);
+    let framed = if ecc {
+        build_framed_ec(message, &key, nonce)
+    } else {
+        build_framed(message, &key, nonce)
+    };
     let payload = BigUint::from_be_bytes(&framed);
     let mut last_capacity = 0usize;
     for ext in 0..128 {
@@ -228,7 +310,7 @@ pub fn embed(
 /// (decoder side; `extract` derives the key from the parsed nonce first).
 pub fn extract_with_key(cf: &[Note], cp: &[Note], key: &[u8; 32]) -> Result<Vec<u8>, StegoError> {
     let decisions = decisions_of(cf, cp).map_err(StegoError::Decode)?;
-    let bytes = rebuild(&decisions);
+    let bytes = unwrap_ec(&rebuild(&decisions))?;
     let (_nonce, claimed) = parse_region(&bytes)?;
 
     // The key-derived IV authenticates the framing boundary: anything but
@@ -254,10 +336,97 @@ pub fn extract_with_key(cf: &[Note], cp: &[Note], key: &[u8; 32]) -> Result<Vec<
 /// The nonce is parsed from the framing; only the passphrase is needed.
 pub fn extract(cf: &[Note], cp: &[Note], passphrase: &str) -> Result<Vec<u8>, StegoError> {
     let decisions = decisions_of(cf, cp).map_err(StegoError::Decode)?;
-    let bytes = rebuild(&decisions);
+    let bytes = unwrap_ec(&rebuild(&decisions))?;
     let (nonce, _claimed) = parse_region(&bytes)?;
     let key = keys::derive_key(passphrase, nonce);
     extract_with_key(cf, cp, &key)
+}
+
+/// M10: split a message across `count` compositions so no single file
+/// carries the whole plaintext. Each shard embeds
+/// `[index u8][total u8][len u8][chunk]` through the normal path; shard
+/// `i` uses `nonce + i`, so `nonce` must be unique per (passphrase,
+/// message) as usual — random per message is the safe default.
+///
+/// Chunk size is `ceil(len / count)` and must fit the per-file u8 length
+/// field (252 bytes): raise `count` for longer messages.
+pub fn embed_split(
+    message: &[u8],
+    passphrase: &str,
+    nonce: u64,
+    count: usize,
+    min_len: usize,
+) -> Result<Vec<Composition>, StegoError> {
+    if count < 2 || count > 255 {
+        return Err(StegoError::Decode("shard count must be 2..=255".into()));
+    }
+    if message.is_empty() {
+        return Err(StegoError::Decode("empty message".into()));
+    }
+    let chunk = (message.len() + count - 1) / count;
+    if chunk > 252 {
+        return Err(StegoError::Decode(
+            "message too long for shard count; raise count".into(),
+        ));
+    }
+    let mut comps = Vec::with_capacity(count);
+    for i in 0..count {
+        let start = i * chunk;
+        let part = &message[start..(start + chunk).min(message.len())];
+        let mut payload = Vec::with_capacity(3 + part.len());
+        payload.push(i as u8);
+        payload.push(count as u8);
+        payload.push(part.len() as u8);
+        payload.extend_from_slice(part);
+        let (comp, _) = embed_inner(&payload, passphrase, nonce.wrapping_add(i as u64), min_len, false)?;
+        comps.push(comp);
+    }
+    Ok(comps)
+}
+
+/// M10: reassemble a message split by `embed_split`. Every shard must be
+/// present exactly once and must declare the same total; any mismatch is
+/// a decode error (a withheld or substituted shard is detectable).
+pub fn extract_join(parts: &[(Vec<Note>, Vec<Note>)], passphrase: &str) -> Result<Vec<u8>, StegoError> {
+    if parts.is_empty() {
+        return Err(StegoError::Decode("no shards".into()));
+    }
+    let mut shards: Vec<(u8, u8, Vec<u8>)> = Vec::with_capacity(parts.len());
+    for (cf, cp) in parts {
+        let payload = extract(cf, cp, passphrase)?;
+        if payload.len() < 3 {
+            return Err(StegoError::Decode("shard payload too short".into()));
+        }
+        let (index, total, slen) = (payload[0], payload[1], payload[2] as usize);
+        if payload.len() != 3 + slen {
+            return Err(StegoError::Decode("corrupt shard payload".into()));
+        }
+        shards.push((index, total, payload[3..].to_vec()));
+    }
+    let total = shards[0].1;
+    let mut seen = vec![false; total as usize];
+    let mut ordered: Vec<Option<&[u8]>> = vec![None; total as usize];
+    for (index, t, chunk) in &shards {
+        if *t != total {
+            return Err(StegoError::Decode("inconsistent shard totals".into()));
+        }
+        let slot = ordered.get_mut(*index as usize).ok_or_else(|| {
+            StegoError::Decode("shard index out of range".to_string())
+        })?;
+        if seen[*index as usize] || slot.is_some() {
+            return Err(StegoError::Decode("duplicate shard".into()));
+        }
+        seen[*index as usize] = true;
+        *slot = Some(chunk);
+    }
+    if ordered.iter().any(|s| s.is_none()) {
+        return Err(StegoError::Decode("missing shard".into()));
+    }
+    let mut out = Vec::new();
+    for chunk in ordered {
+        out.extend_from_slice(chunk.unwrap());
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -466,5 +635,87 @@ mod tests {
         assert_eq!(framed[framed.len() - 1], TRAILER);
         let x = BigUint::from_be_bytes(&framed);
         assert_eq!(x.to_be_bytes(), framed);
+    }
+
+    #[test]
+    fn roundtrip_with_ecc() {
+        for nonce in [1u64, 7] {
+            let msg = b"correct the active warden";
+            let (comp, _len) = embed_with_ecc(msg, "pw", nonce, 16).unwrap();
+            assert_eq!(extract(&comp.cf, &comp.cp, "pw").unwrap(), msg, "nonce {nonce}");
+        }
+    }
+
+    #[test]
+    fn ecc_roundtrip_max_message() {
+        let msg = vec![b'x'; EC_MAX_MESSAGE];
+        let (comp, _len) = embed_with_ecc(&msg, "pw", 3, 8).unwrap();
+        assert_eq!(extract(&comp.cf, &comp.cp, "pw").unwrap(), msg);
+    }
+
+    #[test]
+    fn ecc_majority_recovers_single_copy_corruption() {
+        let key = keys::derive_key("pw", 9);
+        let region = build_framed(b"hi", &key, 9);
+        let mut tri = build_framed_ec(b"hi", &key, 9);
+        assert_eq!(tri[0], EC_SENTINEL);
+        let n = region.len();
+        // Corrupt one byte in each copy at different positions.
+        tri[1 + 2] ^= 0xFF;
+        tri[1 + n + 5] ^= 0xFF;
+        tri[1 + 2 * n + 0] ^= 0xFF;
+        assert_eq!(unwrap_ec(&tri).unwrap(), region);
+    }
+
+    #[test]
+    fn ecc_rejects_bad_layout() {
+        assert!(unwrap_ec(&[EC_SENTINEL]).is_err());
+        assert!(unwrap_ec(&[EC_SENTINEL, 1, 2]).is_err());
+        // Non-ECC payloads pass through untouched.
+        assert_eq!(unwrap_ec(&[0x01, 0x02]).unwrap(), vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn ecc_oversize_message_rejected() {
+        let big = vec![b'x'; EC_MAX_MESSAGE + 1];
+        let res = embed_with_ecc(&big, "pw", 1, 16);
+        assert!(matches!(res, Err(StegoError::Decode(_))));
+    }
+
+    #[test]
+    fn split_join_roundtrip() {
+        // 600 bytes exceeds the single-file cap; three shards carry it.
+        let msg: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
+        let comps = embed_split(&msg, "pw", 555, 3, 8).unwrap();
+        assert_eq!(comps.len(), 3);
+        let parts: Vec<_> = comps.iter().map(|c| (c.cf.clone(), c.cp.clone())).collect();
+        assert_eq!(extract_join(&parts, "pw").unwrap(), msg);
+    }
+
+    #[test]
+    fn split_join_rejects_missing_shard() {
+        let msg: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let comps = embed_split(&msg, "pw", 556, 3, 8).unwrap();
+        let parts: Vec<_> = comps.iter().take(2).map(|c| (c.cf.clone(), c.cp.clone())).collect();
+        let res = extract_join(&parts, "pw");
+        assert!(matches!(res, Err(StegoError::Decode(_))));
+    }
+
+    #[test]
+    fn split_join_rejects_mixed_sets() {
+        let a = embed_split(b"aaaa", "pw", 557, 2, 8).unwrap();
+        let b = embed_split(b"bbbb", "pw", 900, 3, 8).unwrap();
+        let mut parts: Vec<_> = a.iter().map(|c| (c.cf.clone(), c.cp.clone())).collect();
+        parts.push((b[0].cf.clone(), b[0].cp.clone()));
+        let res = extract_join(&parts, "pw");
+        assert!(matches!(res, Err(StegoError::Decode(_))));
+    }
+
+    #[test]
+    fn split_rejects_too_few_shards_for_length() {
+        // 600 bytes / 2 shards = 300-byte chunks > 252-byte u8 field.
+        let msg = vec![b'x'; 600];
+        let res = embed_split(&msg, "pw", 558, 2, 8);
+        assert!(matches!(res, Err(StegoError::Decode(_))));
     }
 }
