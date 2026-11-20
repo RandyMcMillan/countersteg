@@ -193,3 +193,199 @@ pub fn compose2(seed: u64, len: usize) -> Composition2 {
     let mut chooser = crate::composer::RandomChooser::new(seed);
     compose_with2(len, &mut chooser)
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::composer::capacity_bits;
+    use crate::species::first::{compose as compose1, decisions_of as decisions_of1};
+    use crate::theory::is_perfect;
+
+    /// CF note sounding against CP index k (downbeat and upbeat of position i
+    /// both sound against cf[i]).
+    fn cf_at(c: &Composition2, k: usize) -> Note {
+        c.cf[k / 2]
+    }
+
+    #[test]
+    fn downbeats_consonant() {
+        for seed in 0..50 {
+            let c = compose2(seed, 16);
+            for i in 0..c.cf.len() {
+                let iv = Note::semitone_distance(c.cf[i], c.cp[2 * i]);
+                assert!(
+                    crate::theory::is_consonant(iv),
+                    "seed {seed} pos {i}: dissonant downbeat"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn upbeats_consonant_or_legal_passing() {
+        for seed in 0..50 {
+            let c = compose2(seed, 16);
+            for i in 1..c.cf.len() - 1 {
+                let f = c.cf[i];
+                let a = c.cp[2 * i];
+                let b = c.cp[2 * i + 1];
+                let iv = Note::semitone_distance(f, b);
+                if crate::theory::is_consonant(iv) {
+                    continue;
+                }
+                // Dissonant upbeat must be a textbook passing tone:
+                // prev_sound -> a -> b, diatonic steps, same direction.
+                let prev = c.cp[2 * i - 1];
+                let approach = Note::semitone_distance(prev, a);
+                let step = Note::semitone_distance(a, b);
+                assert!(
+                    (1..=2).contains(&approach.abs()),
+                    "seed {seed} pos {i}: passing tone after a leap (approach {approach})"
+                );
+                assert!(
+                    (1..=2).contains(&step.abs()),
+                    "seed {seed} pos {i}: passing tone not a diatonic step ({step})"
+                );
+                assert_eq!(
+                    approach.signum(),
+                    step.signum(),
+                    "seed {seed} pos {i}: passing tone changes direction"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_dissonance_at_penultimate() {
+        for seed in 0..50 {
+            let c = compose2(seed, 16);
+            let n = c.cf.len();
+            for k in [2 * (n - 2), 2 * (n - 2) + 1] {
+                let iv = Note::semitone_distance(cf_at(&c, k), c.cp[k]);
+                assert!(
+                    crate::theory::is_consonant(iv),
+                    "seed {seed}: dissonance at penultimate beat {k}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn boundaries_whole_notes_perfect() {
+        for seed in 0..50 {
+            let c = compose2(seed, 16);
+            let n = c.cf.len();
+            assert_eq!(c.cp[0], c.cp[1], "start must be a single whole note");
+            assert_eq!(
+                c.cp[2 * n - 2],
+                c.cp[2 * n - 1],
+                "end must be a single whole note"
+            );
+            assert!(is_perfect(Note::semitone_distance(c.cf[0], c.cp[0])), "start");
+            assert!(is_perfect(Note::semitone_distance(c.cf[n - 1], c.cp[2 * n - 1])), "end");
+        }
+    }
+
+    #[test]
+    fn penultimate_downbeat_imperfect() {
+        for seed in 0..50 {
+            let c = compose2(seed, 16);
+            let n = c.cf.len();
+            let iv = Note::semitone_distance(c.cf[n - 2], c.cp[2 * (n - 2)]);
+            assert!(
+                !is_perfect(iv),
+                "seed {seed}: penultimate downbeat must be imperfect"
+            );
+        }
+    }
+
+    #[test]
+    fn no_parallel_perfects_half_grid() {
+        for seed in 0..50 {
+            let c = compose2(seed, 16);
+            // CP decisions follow CF decisions in the decision vector; the
+            // decision for beat k sits at index (len - 1) + k.
+            let cp_base = c.cf.len() - 1;
+            for k in 1..c.cp.len() {
+                // Forced fallback steps (arity 1) carry no choice and may
+                // violate motion preferences — same contract as species 1.
+                if c.decisions[cp_base + k].arity == 1 {
+                    continue;
+                }
+                let (prev_cf, cf) = if k % 2 == 0 {
+                    (c.cf[k / 2 - 1], c.cf[k / 2]) // downbeat: CF moves
+                } else {
+                    (c.cf[k / 2], c.cf[k / 2]) // upbeat: CF sustains
+                };
+                let a = Note::semitone_distance(prev_cf, c.cp[k - 1]);
+                let b = Note::semitone_distance(cf, c.cp[k]);
+                if is_perfect(a) && is_perfect(b) && a.rem_euclid(12) == b.rem_euclid(12) {
+                    let cf_m = Note::semitone_distance(prev_cf, cf);
+                    let cp_m = Note::semitone_distance(c.cp[k - 1], c.cp[k]);
+                    assert!(
+                        !(cf_m.signum() == cp_m.signum() && cf_m != 0),
+                        "seed {seed} cp[{k}]: parallel perfect"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deterministic_for_seed() {
+        let a = compose2(123, 16);
+        let b = compose2(123, 16);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn decisions_valid() {
+        for seed in 0..20 {
+            let c = compose2(seed, 16);
+            for d in &c.decisions {
+                assert!(d.arity >= 1 && d.choice < d.arity);
+            }
+            // CF contributes len-1, CP contributes 2 per position.
+            assert_eq!(c.decisions.len(), c.cf.len() - 1 + 2 * c.cp.len() / 2);
+        }
+    }
+
+    #[test]
+    fn replay_roundtrip() {
+        for seed in 0..20 {
+            let c = compose2(seed, 16);
+            let ds = decisions_of2(&c.cf, &c.cp).unwrap();
+            assert_eq!(ds, c.decisions, "seed {seed}: replay mismatch");
+        }
+    }
+
+    #[test]
+    fn capacity_gain_over_species1() {
+        // Measured over seeds 0..50: ~1.47x at len 8/16, ~1.51x at len 32.
+        // Below the naive 2x because boundary positions carry zero-bit
+        // upbeats and upbeats have smaller candidate sets than downbeats.
+        for len in [8, 16, 32] {
+            let cap2: usize = (0..20)
+                .map(|s| capacity_bits(&compose2(s, len).decisions))
+                .sum();
+            let cap1: usize = (0..20)
+                .map(|s| capacity_bits(&compose1(s, len).decisions))
+                .sum();
+            assert!(
+                cap2 * 5 > cap1 * 7,
+                "len {len}: species-2 capacity {cap2} not > 1.4x species-1 {cap1}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_wrong_shape() {
+        let c = compose2(1, 8);
+        assert!(decisions_of2(&c.cf, &c.cf).is_err());
+        let c1 = compose1(1, 8);
+        assert!(decisions_of2(&c1.cf, &c1.cp).is_err());
+        // Sanity: species-1 decoder still accepts species-1 shapes.
+        assert!(decisions_of1(&c1.cf, &c1.cp).is_ok());
+    }
+}
