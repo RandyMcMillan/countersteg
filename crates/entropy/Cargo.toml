@@ -1,11 +1,9 @@
 [package]
-name = "countersteg-entropy"
+name = "entropy"
 version = "0.1.0"
 edition = "2021"
-description = "Xoroshiro128++ keystream and Shannon entropy for CounterSteg"
+description = "Keystream PRNG, Shannon entropy, stream health stats"
 license = "MIT"
-
-[dependencies]
 
 [dev-dependencies]
 rand_xoshiro = "0.6"
