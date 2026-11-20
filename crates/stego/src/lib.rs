@@ -498,3 +498,254 @@ mod tests {
 
     #[test]
     fn roundtrip_short_message() {
+        let msg = b"hi";
+        let (comp, _len) = embed(msg, "pw", 42, 16).unwrap();
+        let out = extract(&comp.cf, &comp.cp, "pw").unwrap();
+        assert_eq!(out, msg);
+    }
+
+    #[test]
+    fn roundtrip_various() {
+        for nonce in [1u64, 7, 123] {
+            let msg = b"attack at dawn";
+            let (comp, _len) = embed(msg, "s3cret", nonce, 16).unwrap();
+            let out = extract(&comp.cf, &comp.cp, "s3cret").unwrap();
+            assert_eq!(out, msg, "nonce {nonce}");
+        }
+    }
+
+    #[test]
+    fn roundtrip_max_message() {
+        // 255 bytes is the cap; it must fit within the extension budget.
+        let msg = vec![b'x'; 255];
+        let (comp, len) = embed(&msg, "pw", 1, 8).unwrap();
+        assert!(len > 8, "extension should have happened");
+        let out = extract(&comp.cf, &comp.cp, "pw").unwrap();
+        assert_eq!(out, msg);
+    }
+
+    #[test]
+    fn wrong_key_fails() {
+        let (comp, _) = embed(b"secret", "right", 9, 16).unwrap();
+        let res = extract(&comp.cf, &comp.cp, "wrong");
+        assert!(matches!(res, Err(StegoError::WrongKey) | Err(StegoError::Decode(_))));
+    }
+
+    #[test]
+    fn max_message_fits() {
+        // The 255-byte cap must fit within the extension budget even with
+        // the 43-byte region overhead (~2384 bits).
+        let big = vec![b'x'; 255];
+        let (comp, len) = embed(&big, "pw", 1, 8).unwrap();
+        assert!(len > 8, "extension should have happened");
+        assert_eq!(extract(&comp.cf, &comp.cp, "pw").unwrap(), big);
+    }
+
+    #[test]
+    fn extension_finds_fitting_length() {
+        // Every accepted (nonce, min_len) must roundtrip: the embed
+        // self-check replays the full extraction before returning.
+        for nonce in 0..20u64 {
+            let msg = b"boundary probe";
+            let (comp, _len) = embed(msg, "pw", nonce, 16).unwrap();
+            assert_eq!(
+                extract(&comp.cf, &comp.cp, "pw").unwrap(),
+                msg,
+                "nonce {nonce}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversize_message_rejected() {
+        let big = vec![b'x'; 256];
+        let res = embed(&big, "pw", 1, 16);
+        assert!(matches!(res, Err(StegoError::Decode(_))));
+    }
+
+    #[test]
+    fn embedded_music_still_valid() {
+        let (comp, _) = embed(b"rules still hold under payload steering", "pw", 5, 16).unwrap();
+        for i in 0..comp.cf.len() {
+            assert!(is_consonant(Note::semitone_distance(comp.cf[i], comp.cp[i])));
+        }
+    }
+
+    #[test]
+    fn embedded_file_carries_no_identifying_metadata() {
+        // M6 regression: embedded files must be indistinguishable from plain
+        // MIDI — no track name, no countersteg-identifying byte strings.
+        let (comp, _) = embed(b"metadata probe", "pw", 11, 16).unwrap();
+        let bytes = engine::write_smf_named(&comp, None);
+        let data = engine::read_smf(&bytes).unwrap();
+        assert!(data.track_name.is_none(), "embedded file must not carry a track name");
+        for marker in [b"countersteg".as_slice(), b"Countersteg", b"seed:", b"nonce"] {
+            let found = bytes
+                .windows(marker.len())
+                .any(|w| w.eq_ignore_ascii_case(marker));
+            assert!(!found, "embedded file contains identifying marker {marker:?}");
+        }
+    }
+
+    /// M8: the warden's own test. Embed across 24 fixed seeds and compare
+    /// the per-arity choice distribution against the natural `compose`
+    /// baseline. Total variation must stay under 0.15 for every arity —
+    /// the same threshold a warden would use to separate the two.
+    #[test]
+    fn self_steganalysis_distribution_matches_natural() {
+        let msg = b"distribution probe";
+        let len = 64;
+        let mut embedded: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut natural: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for seed in 0..24u64 {
+            let (comp, _) = embed(msg, "pw", 1_000 + seed, len).unwrap();
+            let ds = decisions_of(&comp.cf, &comp.cp).unwrap();
+            for (arity, counts) in tally(&ds) {
+                let v = embedded.entry(arity).or_insert_with(|| vec![0; arity as usize]);
+                for (i, c) in counts.iter().enumerate() {
+                    v[i] += c;
+                }
+            }
+            let nat = engine::compose(seed, len);
+            for (arity, counts) in tally(&nat.decisions) {
+                let v = natural.entry(arity).or_insert_with(|| vec![0; arity as usize]);
+                for (i, c) in counts.iter().enumerate() {
+                    v[i] += c;
+                }
+            }
+        }
+        let tv = total_variation(&embedded, &natural);
+        assert!(!tv.is_empty(), "no overlapping arity buckets");
+        for (arity, d) in tv {
+            assert!(d < 0.15, "arity {arity}: total variation {d:.3} vs natural");
+        }
+    }
+
+    /// M7: steered decisions must use the FULL candidate range at every
+    /// arity, not just `2^n` of it (the v2 chunk-chooser bias).
+    #[test]
+    fn payload_choices_use_full_arity() {
+        // Aggregate across 12 nonces: uniform digits must collectively hit
+        // every candidate at every arity (a single short path may miss one).
+        let mut agg: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for nonce in 0..12u64 {
+            let (comp, _) = embed(b"\xAA", "pw", nonce, 32).unwrap();
+            let ds = decisions_of(&comp.cf, &comp.cp).unwrap();
+            for (arity, counts) in tally(&ds) {
+                let v = agg.entry(arity).or_insert_with(|| vec![0; arity as usize]);
+                for (i, c) in counts.iter().enumerate() {
+                    v[i] += c;
+                }
+            }
+        }
+        for (arity, counts) in agg {
+            for (i, &c) in counts.iter().enumerate() {
+                assert!(c > 0, "arity {arity}: candidate {i} never taken");
+            }
+        }
+    }
+
+    /// The framing boundary is authenticated by the key-derived IV before
+    /// the claimed length is trusted: flipping a note must not decode.
+    #[test]
+    fn tampered_score_fails() {
+        let (mut comp, _) = embed(b"integrity probe", "pw", 77, 16).unwrap();
+        let i = comp.cf.len() / 2;
+        comp.cp[i] = comp.cf[i]; // break the counterpoint relationship
+        let res = extract(&comp.cf, &comp.cp, "pw");
+        assert!(matches!(res, Err(StegoError::WrongKey) | Err(StegoError::Decode(_))));
+    }
+
+    #[test]
+    fn framed_region_has_stable_end_bytes() {
+        // Sentinel and trailer survive the integer round trip.
+        let key = keys::derive_key("pw", 42);
+        let framed = build_framed(b"hi", &key, 42);
+        assert_eq!(framed[0], SENTINEL);
+        assert_eq!(framed[framed.len() - 1], TRAILER);
+        let x = BigUint::from_be_bytes(&framed);
+        assert_eq!(x.to_be_bytes(), framed);
+    }
+
+    #[test]
+    fn roundtrip_with_ecc() {
+        for nonce in [1u64, 7] {
+            let msg = b"correct the active warden";
+            let (comp, _len) = embed_with_ecc(msg, "pw", nonce, 16).unwrap();
+            assert_eq!(extract(&comp.cf, &comp.cp, "pw").unwrap(), msg, "nonce {nonce}");
+        }
+    }
+
+    #[test]
+    fn ecc_roundtrip_max_message() {
+        let msg = vec![b'x'; EC_MAX_MESSAGE];
+        let (comp, _len) = embed_with_ecc(&msg, "pw", 3, 8).unwrap();
+        assert_eq!(extract(&comp.cf, &comp.cp, "pw").unwrap(), msg);
+    }
+
+    #[test]
+    fn ecc_majority_recovers_single_copy_corruption() {
+        let key = keys::derive_key("pw", 9);
+        let region = build_framed(b"hi", &key, 9);
+        let mut tri = build_framed_ec(b"hi", &key, 9);
+        assert_eq!(tri[0], EC_SENTINEL);
+        let n = region.len();
+        // Corrupt one byte in each copy at different positions.
+        tri[1 + 2] ^= 0xFF;
+        tri[1 + n + 5] ^= 0xFF;
+        tri[1 + 2 * n + 0] ^= 0xFF;
+        assert_eq!(unwrap_ec(&tri).unwrap(), region);
+    }
+
+    #[test]
+    fn ecc_rejects_bad_layout() {
+        assert!(unwrap_ec(&[EC_SENTINEL]).is_err());
+        assert!(unwrap_ec(&[EC_SENTINEL, 1, 2]).is_err());
+        // Non-ECC payloads pass through untouched.
+        assert_eq!(unwrap_ec(&[0x01, 0x02]).unwrap(), vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn ecc_oversize_message_rejected() {
+        let big = vec![b'x'; EC_MAX_MESSAGE + 1];
+        let res = embed_with_ecc(&big, "pw", 1, 16);
+        assert!(matches!(res, Err(StegoError::Decode(_))));
+    }
+
+    #[test]
+    fn split_join_roundtrip() {
+        // 600 bytes exceeds the single-file cap; three shards carry it.
+        let msg: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
+        let comps = embed_split(&msg, "pw", 555, 3, 8).unwrap();
+        assert_eq!(comps.len(), 3);
+        let parts: Vec<_> = comps.iter().map(|c| (c.cf.clone(), c.cp.clone())).collect();
+        assert_eq!(extract_join(&parts, "pw").unwrap(), msg);
+    }
+
+    #[test]
+    fn split_join_rejects_missing_shard() {
+        let msg: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let comps = embed_split(&msg, "pw", 556, 3, 8).unwrap();
+        let parts: Vec<_> = comps.iter().take(2).map(|c| (c.cf.clone(), c.cp.clone())).collect();
+        let res = extract_join(&parts, "pw");
+        assert!(matches!(res, Err(StegoError::Decode(_))));
+    }
+
+    #[test]
+    fn split_join_rejects_mixed_sets() {
+        let a = embed_split(b"aaaa", "pw", 557, 2, 8).unwrap();
+        let b = embed_split(b"bbbb", "pw", 900, 3, 8).unwrap();
+        let mut parts: Vec<_> = a.iter().map(|c| (c.cf.clone(), c.cp.clone())).collect();
+        parts.push((b[0].cf.clone(), b[0].cp.clone()));
+        let res = extract_join(&parts, "pw");
+        assert!(matches!(res, Err(StegoError::Decode(_))));
+    }
+
+    #[test]
+    fn split_rejects_too_few_shards_for_length() {
+        // 600 bytes / 2 shards = 300-byte chunks > 252-byte u8 field.
+        let msg = vec![b'x'; 600];
+        let res = embed_split(&msg, "pw", 558, 2, 8);
+        assert!(matches!(res, Err(StegoError::Decode(_))));
+    }
+}
