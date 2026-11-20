@@ -11,15 +11,25 @@
 //! `v % arity == v`. The chosen candidate index *is* the payload bits — the
 //! decoder reads them back directly, with no bias and no ambiguity.
 //!
-//! Bitstream layout (MSB-first across decisions):
-//! `[u8 plaintext length][keystream-XOR ciphertext][zero padding]`
-//! (messages are capped at 255 bytes — channel capacity is precious)
+//! Bitstream layout (MSB-first across decisions), framing v2:
+//! `[nonce le64][u8 plaintext length][keystream-XOR ciphertext][16-byte MAC tag]`
+//! (messages are capped at 255 bytes — channel capacity is precious).
 //!
-//! The pre-cipher (keys + entropy crates) runs before channel encoding, so
+//! Once the framing bits are consumed, generation falls back to a PRNG
+//! chooser for all remaining decisions, so the tail of an embedded score is
+//! distributed exactly like a natural composition (no candidate-0 padding
+//! signature; see MITIGATIONS.md M4).
+//!
+//! The nonce is not secret and not metadata: it travels inside the framing
+//! and keys the pre-cipher, so reusing a passphrase across messages never
+//! reuses a keystream (MITIGATIONS.md M1). Nothing about the file identifies
+//! it as countersteg output — the seed the *Compose* path publishes is a
+//! public demo convenience and never appears in embedded files.
+//!
+//! The pre-cipher (keys crate, v2 schedule) runs before channel encoding, so
 //! the channel bitstream is computationally indistinguishable from random.
 
-use engine::{compose_with, decisions_of, Chooser, Composition, Decision, Note};
-use entropy::Xoroshiro128PlusPlus;
+use engine::{compose_with, decisions_of, Chooser, Composition, Decision, Note, RandomChooser};
 
 mod bits;
 pub use bits::{BitReader, BitWriter};
@@ -46,15 +56,34 @@ impl std::fmt::Display for StegoError {
 
 impl std::error::Error for StegoError {}
 
-/// Chooser that steers generation from a payload bitstream.
+/// Chooser that steers generation from the framed bitstream, then falls back
+/// to a natural PRNG chooser once the framing is consumed. The fallback
+/// keeps the score's tail distributionally identical to plain composition
+/// (the old zero-padding design picked candidate 0 at every tail decision —
+/// a glaring statistical signature; see MITIGATIONS.md A3/M4).
+///
+/// Capacity subtlety: a path "fits" only if the framing ends exactly on a
+/// decision boundary. A decision whose n bits straddle the end of the
+/// stream (some bits remain, but fewer than n) is flagged — extending the
+/// score changes the path, so a later extension may align.
 struct PayloadChooser<'a> {
     bits: BitReader<'a>,
-    overflow: bool,
+    fallback: RandomChooser,
+    straddled: bool,
 }
 
 impl<'a> PayloadChooser<'a> {
-    fn new(bits: BitReader<'a>) -> Self {
-        Self { bits, overflow: false }
+    fn new(bits: BitReader<'a>, fallback_seed: u64) -> Self {
+        Self {
+            bits,
+            fallback: RandomChooser::new(fallback_seed),
+            straddled: false,
+        }
+    }
+
+    /// Framing bits eaten so far; equals the score's payload capacity used.
+    fn consumed_bits(&self) -> usize {
+        self.bits.consumed()
     }
 }
 
@@ -67,43 +96,54 @@ impl<'a> Chooser for PayloadChooser<'a> {
         match self.bits.take(n as usize) {
             Some(v) => v % arity, // no-op: v < 2^n <= arity (see module docs)
             None => {
-                self.overflow = true;
-                0
+                if self.bits.remaining() > 0 {
+                    // The framing's tail bits (fewer than n) cannot be
+                    // encoded by this decision — the path is too short.
+                    self.straddled = true;
+                }
+                self.fallback.choose(arity)
             }
         }
     }
 }
 
-/// Build the framed bitstream: length byte + ciphertext + MAC tag, zero-padded.
-fn build_bitstream(message: &[u8], passphrase: &str, seed: u64, capacity_bits: usize) -> Vec<u8> {
-    let mut body = message.to_vec();
-    let mut ks: Xoroshiro128PlusPlus = keys::keystream(passphrase, seed);
-    entropy::apply_keystream(&mut body, &mut ks);
-    let tag = keys::mac_tag(passphrase, seed, &body);
+/// Framing v2: nonce(8) || length(1) || ciphertext(len) || MAC tag(16).
+pub const NONCE_BYTES: usize = 8;
+pub const LEN_BYTES: usize = 1;
+pub const TAG_BYTES: usize = 16;
 
-    let mut framed = Vec::with_capacity(2 + message.len());
+/// Framing overhead in bits for a message of `msg_len` bytes.
+pub fn framing_bits(msg_len: usize) -> usize {
+    (NONCE_BYTES + LEN_BYTES + TAG_BYTES + msg_len) * 8
+}
+
+/// Build the framed bitstream (exactly `framing_bits` bytes — no padding).
+fn build_bitstream(message: &[u8], key: &[u8; 32], nonce: u64) -> Vec<u8> {
+    let mut body = message.to_vec();
+    keys::apply_keystream_with_key(&mut body, key);
+    let tag = keys::mac_tag_from_key(key, &body);
+
+    let mut framed = Vec::with_capacity(NONCE_BYTES + LEN_BYTES + TAG_BYTES + message.len());
+    framed.extend_from_slice(&nonce.to_le_bytes());
     framed.push(message.len() as u8);
     framed.extend_from_slice(&body);
-    framed.push(tag);
+    framed.extend_from_slice(&tag);
+    framed
+}
 
-    let mut bw = BitWriter::new();
-    // Framing first, then zero padding out to the full requested capacity.
-    for i in 0..capacity_bits {
-        let bit = if i < framed.len() * 8 {
-            (framed[i / 8] >> (7 - (i % 8))) & 1
-        } else {
-            0
-        };
-        bw.push(bit);
-    }
-    bw.into_bytes()
+/// Seed for the fallback PRNG chooser: keyed so the tail is reproducible
+/// for the decoder's replay of decisions (decode only reads framing bits,
+/// but keyed fallback keeps the whole path deterministic for testing).
+fn fallback_seed(key: &[u8; 32]) -> u64 {
+    let d = keys::sha256(&[b"countersteg-fallback", key]);
+    u64::from_le_bytes(d[..8].try_into().unwrap())
 }
 
 /// Payload capacity estimate (bits) for a score of `len` whole notes.
 /// The exact capacity depends on the choices taken; treat this as a
 /// lower-bound hint (see `embed`, which verifies the real figure).
-pub fn available_bits(seed: u64, len: usize) -> usize {
-    let comp = engine::compose(seed, len);
+pub fn available_bits(nonce: u64, len: usize) -> usize {
+    let comp = engine::compose(nonce, len);
     engine::capacity_bits(&comp.decisions)
 }
 
@@ -111,32 +151,44 @@ pub fn available_bits(seed: u64, len: usize) -> usize {
 /// positions and extends the score until the actual (path-dependent)
 /// capacity fits the framing — capacity grows roughly linearly with length.
 ///
-/// Returns the composition (persist it with `write_smf_named(.., seed)`)
-/// and the length that fit. Fails with precise capacity after 64 extensions.
+/// `nonce` must be unique per (passphrase, message): it keys the keystream
+/// and travels in the framing. Random per message is the safe default.
+///
+/// Returns the composition (persist it with `write_smf_named(.., None)` —
+/// embedded files carry no identifying metadata) and the length that fit.
+/// Fails with precise capacity after 128 extensions.
 pub fn embed(
     message: &[u8],
     passphrase: &str,
-    seed: u64,
+    nonce: u64,
     min_len: usize,
 ) -> Result<(Composition, usize), StegoError> {
     if message.len() > 255 {
         return Err(StegoError::Decode("message exceeds 255 bytes".into()));
     }
-    let needed = (2 + message.len()) * 8;
+    let needed = framing_bits(message.len());
+    // Derive once: stretching is ~100k SHA-256 rounds and the loop below
+    // may try many score lengths.
+    let key = keys::derive_key(passphrase, nonce);
+    let fb = fallback_seed(&key);
     let mut last_capacity = 0usize;
-    for ext in 0..64 {
+    // Success requires the framing to end exactly on a decision boundary:
+    // every framing bit steered, no straddle (a decision whose n bits could
+    // not all fit in the remaining stream). 128 extensions (~1000 notes)
+    // covers the 255-byte message cap with the 25-byte v2 framing overhead
+    // on the current engine's capacity curve (~3 bits per whole note).
+    for ext in 0..128 {
         let len = min_len + ext * 8;
-        // Stream sized to a per-decision upper bound (arity <= 15 -> n <= 4)
-        // so the payload path can never exhaust it; bits past the framing are
-        // zero padding. Capacity is then read back from the taken path.
-        let bound = (2 * len - 1) * 4;
-        let stream = build_bitstream(message, passphrase, seed, bound);
-        let mut chooser = PayloadChooser::new(BitReader::new(&stream));
+        let stream = build_bitstream(message, &key, nonce);
+        let mut chooser = PayloadChooser::new(BitReader::new(&stream), fb);
         let comp = compose_with(len, &mut chooser);
         last_capacity = decisions_of(&comp.cf, &comp.cp)
             .map(|ds| engine::capacity_bits(&ds))
             .unwrap_or(0);
-        if !chooser.overflow && last_capacity >= needed {
+        // Success requires the framing to end exactly on a decision
+        // boundary: every framing bit steered, no straddle (a decision
+        // whose n bits could not all fit in the remaining stream).
+        if !chooser.straddled && chooser.consumed_bits() >= needed {
             return Ok((comp, len));
         }
     }
@@ -147,8 +199,8 @@ pub fn embed(
 }
 
 /// Extract a message from a composition's notes (decoder side).
-/// `seed` must match the embedding seed (carried in the MIDI track name).
-pub fn extract(cf: &[Note], cp: &[Note], passphrase: &str, seed: u64) -> Result<Vec<u8>, StegoError> {
+/// The nonce is parsed from the framing; only the passphrase is needed.
+pub fn extract(cf: &[Note], cp: &[Note], passphrase: &str) -> Result<Vec<u8>, StegoError> {
     let decisions = decisions_of(cf, cp).map_err(StegoError::Decode)?;
 
     let mut bw = BitWriter::new();
@@ -162,20 +214,24 @@ pub fn extract(cf: &[Note], cp: &[Note], passphrase: &str, seed: u64) -> Result<
     }
     let bytes = bw.into_bytes();
 
-    if bytes.is_empty() {
+    if bytes.len() < NONCE_BYTES + LEN_BYTES + TAG_BYTES {
         return Err(StegoError::Decode("bitstream too short".into()));
     }
-    let claimed = bytes[0] as usize;
-    if claimed + 2 > bytes.len() {
+    let nonce = u64::from_le_bytes(bytes[..NONCE_BYTES].try_into().unwrap());
+    let claimed = bytes[NONCE_BYTES] as usize;
+    if NONCE_BYTES + LEN_BYTES + claimed + TAG_BYTES > bytes.len() {
         return Err(StegoError::WrongKey);
     }
-    let mut body = bytes[1..1 + claimed].to_vec();
-    let tag = bytes[1 + claimed];
-    if keys::mac_tag(passphrase, seed, &body) != tag {
+    let key = keys::derive_key(passphrase, nonce);
+    let body_start = NONCE_BYTES + LEN_BYTES;
+    let mut body = bytes[body_start..body_start + claimed].to_vec();
+    let tag: [u8; TAG_BYTES] = bytes[body_start + claimed..body_start + claimed + TAG_BYTES]
+        .try_into()
+        .unwrap();
+    if keys::mac_tag_from_key(&key, &body) != tag {
         return Err(StegoError::WrongKey);
     }
-    let mut ks: Xoroshiro128PlusPlus = keys::keystream(passphrase, seed);
-    entropy::apply_keystream(&mut body, &mut ks);
+    keys::apply_keystream_with_key(&mut body, &key);
     Ok(body)
 }
 
@@ -188,32 +244,77 @@ mod tests {
     fn roundtrip_short_message() {
         let msg = b"hi";
         let (comp, _len) = embed(msg, "pw", 42, 16).unwrap();
-        let out = extract(&comp.cf, &comp.cp, "pw", 42).unwrap();
+        let out = extract(&comp.cf, &comp.cp, "pw").unwrap();
         assert_eq!(out, msg);
     }
 
     #[test]
     fn roundtrip_various() {
-        for seed in [1u64, 7, 123] {
+        for nonce in [1u64, 7, 123] {
             let msg = b"attack at dawn";
-            let (comp, _len) = embed(msg, "s3cret", seed, 16).unwrap();
-            let out = extract(&comp.cf, &comp.cp, "s3cret", seed).unwrap();
-            assert_eq!(out, msg, "seed {seed}");
+            let (comp, _len) = embed(msg, "s3cret", nonce, 16).unwrap();
+            let out = extract(&comp.cf, &comp.cp, "s3cret").unwrap();
+            assert_eq!(out, msg, "nonce {nonce}");
         }
+    }
+
+    #[test]
+    fn roundtrip_max_message() {
+        // 255 bytes is the cap; it must fit within the 64-extension budget.
+        let msg = vec![b'x'; 255];
+        let (comp, len) = embed(&msg, "pw", 1, 8).unwrap();
+        assert!(len > 8, "extension should have happened");
+        let out = extract(&comp.cf, &comp.cp, "pw").unwrap();
+        assert_eq!(out, msg);
     }
 
     #[test]
     fn wrong_key_fails() {
         let (comp, _) = embed(b"secret", "right", 9, 16).unwrap();
-        let res = extract(&comp.cf, &comp.cp, "wrong", 9);
+        let res = extract(&comp.cf, &comp.cp, "wrong");
         assert!(matches!(res, Err(StegoError::WrongKey) | Err(StegoError::Decode(_))));
     }
 
     #[test]
-    fn capacity_enforced() {
-        let big = vec![b'x'; 255]; // max message, far beyond any 64-extension score
-        let res = embed(&big, "pw", 1, 8);
-        assert!(matches!(res, Err(StegoError::CapacityExceeded { .. })));
+    fn max_message_fits() {
+        // The 255-byte cap must fit within the extension budget even with
+        // the 25-byte v2 framing overhead (~2240 bits).
+        let big = vec![b'x'; 255];
+        let (comp, len) = embed(&big, "pw", 1, 8).unwrap();
+        assert!(len > 8, "extension should have happened");
+        assert_eq!(extract(&comp.cf, &comp.cp, "pw").unwrap(), big);
+    }
+
+    #[test]
+    fn straddle_extends_until_boundary() {
+        // Embed must not return a score whose decision straddles the end of
+        // the framing (the v1 corruption bug): every success ends exactly on
+        // a decision boundary, so decode must always succeed for any nonce
+        // and minimum length that embed accepts.
+        for nonce in 0..20u64 {
+            let msg = b"boundary probe";
+            let (comp, _len) = embed(msg, "pw", nonce, 16).unwrap();
+            assert_eq!(
+                extract(&comp.cf, &comp.cp, "pw").unwrap(),
+                msg,
+                "nonce {nonce}"
+            );
+        }
+    }
+
+    #[test]
+    fn tail_has_no_candidate_zero_signature() {
+        // M4 regression: after the framing is consumed, the fallback PRNG
+        // chooser drives the tail. A long score with a 1-byte message must
+        // therefore take some non-zero choices late in the path.
+        let (comp, len) = embed(b"\xAA", "pw", 3, 64).unwrap();
+        assert!(len >= 64);
+        let ds = decisions_of(&comp.cf, &comp.cp).unwrap();
+        let tail = &ds[ds.len() - 32..];
+        assert!(
+            tail.iter().any(|d| d.choice > 0),
+            "fallback tail picked candidate 0 at every decision (padding signature)"
+        );
     }
 
     #[test]
@@ -233,13 +334,24 @@ mod tests {
 
     #[test]
     fn channel_choices_match_payload_bits() {
-        // Encoder invariant: choice == payload bits < 2^n at each decision.
-        let (comp, _) = embed(b"\xAA", "pw", 3, 16).unwrap();
+        // Encoder invariant: at payload (framing) decisions the choice is
+        // the steered bits, so choice < 2^n. Tail decisions are driven by
+        // the fallback PRNG and may take any index < arity.
+        let msg = b"\xAA";
+        let (comp, _) = embed(msg, "pw", 3, 16).unwrap();
+        let needed = framing_bits(msg.len());
         let ds = decisions_of(&comp.cf, &comp.cp).unwrap();
+        let mut seen = 0usize;
         for d in &ds {
-            if d.bits() > 0 {
-                assert!(d.choice < (1 << d.bits()), "choice fits n bits");
+            let n = d.bits();
+            if n == 0 {
+                continue;
             }
+            if seen < needed {
+                assert!(d.choice < (1 << n), "payload choice fits n bits");
+            }
+            seen += n as usize;
         }
+        assert!(seen >= needed);
     }
 }
