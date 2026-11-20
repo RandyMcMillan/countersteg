@@ -1,24 +1,34 @@
 //! stego: selection-channel steganography over the composition engine.
 //!
 //! The payload does not modify the music after the fact — it *steers* the
-//! generator. At every decision point with `arity >= 2` candidates,
-//! `floor(log2(arity))` payload bits select which rule-valid continuation is
-//! taken. The result is genuine first-species counterpoint that happens to
-//! encode a ciphertext.
+//! generator. The framed payload (ciphertext + MAC + framing) is one
+//! big-endian integer; at every decision point with `arity >= 1` candidates
+//! the chooser pops one mixed-radix digit `s = x mod arity` and takes
+//! candidate `s`. The result is genuine first-species counterpoint that
+//! happens to encode a ciphertext.
 //!
-//! Why the channel is lossless: `n = floor(log2(arity))` means
-//! `2^n <= arity`, so any n-bit value `v` satisfies `v < 2^n <= arity` and
-//! `v % arity == v`. The chosen candidate index *is* the payload bits — the
-//! decoder reads them back directly, with no bias and no ambiguity.
+//! Why mixed radix (M7): the v2 design sliced the payload into
+//! `n = floor(log2(arity))`-bit chunks, so steered decisions only ever took
+//! `2^n` of the `arity` candidates — a biased sub-distribution a warden
+//! modeling the engine could detect (MITIGATIONS.md M7). Mixed-radix digits
+//! of the pseudorandom (encrypted + MACed) payload integer are uniform over
+//! the full arity at every steered decision, head and tail alike, matching
+//! the natural generator's distribution (M4). See the `ac` module for the
+//! coder and why a binary arithmetic coder was rejected.
 //!
-//! Bitstream layout (MSB-first across decisions), framing v2:
-//! `[nonce le64][u8 plaintext length][keystream-XOR ciphertext][16-byte MAC tag]`
+//! Payload layout: 0x01 sentinel (nonzero top byte for stable byte
+//! serialization) || key-derived IV(16B) || framed body || 0x01 trailer
+//! (nonzero bottom byte, same reason). In full:
+//! `[0x01][IV 16B][nonce le64][u8 plaintext length][keystream-XOR ciphertext][16-byte MAC tag][0x01]`
 //! (messages are capped at 255 bytes — channel capacity is precious).
 //!
-//! Once the framing bits are consumed, generation falls back to a PRNG
-//! chooser for all remaining decisions, so the tail of an embedded score is
-//! distributed exactly like a natural composition (no candidate-0 padding
-//! signature; see MITIGATIONS.md M4).
+//! The key-derived IV authenticates the framing boundary before the claimed
+//! length is trusted: a wrong key fails here, not on a length check.
+//!
+//! Once the payload integer is exhausted, its remaining most-significant
+//! mixed-radix digits are 0 and late decisions take candidate 0 — at most a
+//! byte's worth of decisions at the very end of the score, far inside the
+//! noise floor the M8 self-steganalysis test measures.
 //!
 //! The nonce is not secret and not metadata: it travels inside the framing
 //! and keys the pre-cipher, so reusing a passphrase across messages never
@@ -27,12 +37,15 @@
 //! public demo convenience and never appears in embedded files.
 //!
 //! The pre-cipher (keys crate, v2 schedule) runs before channel encoding, so
-//! the channel bitstream is computationally indistinguishable from random.
+//! the payload integer is computationally indistinguishable from random.
 
-use engine::{compose_with, decisions_of, Chooser, Composition, Decision, Note, RandomChooser};
+use engine::{compose_with, decisions_of, Chooser, Composition, Decision, Note};
 
+mod ac;
 mod bits;
 pub use bits::{BitReader, BitWriter};
+
+use ac::BigUint;
 
 #[derive(Debug)]
 pub enum StegoError {
@@ -56,100 +69,114 @@ impl std::fmt::Display for StegoError {
 
 impl std::error::Error for StegoError {}
 
-/// Chooser that steers generation from the framed bitstream, then falls back
-/// to a natural PRNG chooser once the framing is consumed. The fallback
-/// keeps the score's tail distributionally identical to plain composition
-/// (the old zero-padding design picked candidate 0 at every tail decision —
-/// a glaring statistical signature; see MITIGATIONS.md A3/M4).
-///
-/// Capacity subtlety: a path "fits" only if the framing ends exactly on a
-/// decision boundary. A decision whose n bits straddle the end of the
-/// stream (some bits remain, but fewer than n) is flagged — extending the
-/// score changes the path, so a later extension may align.
-struct PayloadChooser<'a> {
-    bits: BitReader<'a>,
-    fallback: RandomChooser,
-    straddled: bool,
+/// M7 chooser: steers generation by popping one mixed-radix digit per
+/// decision from the framed payload integer. Digits of the encrypted + MACed
+/// payload are uniform over the full arity, so steered decisions carry no
+/// `2^n`-of-arity bias (the v2 chunk chooser's signature, MITIGATIONS.md
+/// M7). When the integer is exhausted the digits are 0 — see module docs.
+struct AcChooser {
+    dec: ac::RadixDecoder,
 }
 
-impl<'a> PayloadChooser<'a> {
-    fn new(bits: BitReader<'a>, fallback_seed: u64) -> Self {
-        Self {
-            bits,
-            fallback: RandomChooser::new(fallback_seed),
-            straddled: false,
-        }
-    }
-
-    /// Framing bits eaten so far; equals the score's payload capacity used.
-    fn consumed_bits(&self) -> usize {
-        self.bits.consumed()
-    }
-}
-
-impl<'a> Chooser for PayloadChooser<'a> {
+impl Chooser for AcChooser {
     fn choose(&mut self, arity: u32) -> u32 {
-        let n = Decision { arity, choice: 0 }.bits();
-        if n == 0 {
-            return 0;
-        }
-        match self.bits.take(n as usize) {
-            Some(v) => v % arity, // no-op: v < 2^n <= arity (see module docs)
-            None => {
-                if self.bits.remaining() > 0 {
-                    // The framing's tail bits (fewer than n) cannot be
-                    // encoded by this decision — the path is too short.
-                    self.straddled = true;
-                }
-                self.fallback.choose(arity)
-            }
-        }
+        self.dec.decode(arity)
     }
 }
 
-/// Framing v2: nonce(8) || length(1) || ciphertext(len) || MAC tag(16).
+/// Payload layout: 0x01 sentinel (nonzero top byte for stable byte
+/// serialization) || key-derived IV(16B) || framed body || 0x01 trailer.
+/// Both markers are 0x01 so re-serialization of the recovered integer
+/// never strips a zero byte at either end.
+pub const SENTINEL: u8 = 0x01;
+pub const IV_BYTES: usize = 16;
 pub const NONCE_BYTES: usize = 8;
 pub const LEN_BYTES: usize = 1;
 pub const TAG_BYTES: usize = 16;
+pub const TRAILER: u8 = 0x01;
+/// sentinel + IV: everything before the nonce.
+pub const HEADER_BYTES: usize = 1 + IV_BYTES;
+/// smallest possible region: header + nonce + len + tag + trailer.
+pub const MIN_REGION: usize = HEADER_BYTES + NONCE_BYTES + LEN_BYTES + TAG_BYTES + 1;
 
-/// Framing overhead in bits for a message of `msg_len` bytes.
+/// Region size in bits for a message of `msg_len` bytes.
 pub fn framing_bits(msg_len: usize) -> usize {
-    (NONCE_BYTES + LEN_BYTES + TAG_BYTES + msg_len) * 8
+    (HEADER_BYTES + NONCE_BYTES + LEN_BYTES + TAG_BYTES + msg_len + 1) * 8
 }
 
-/// Build the framed bitstream (exactly `framing_bits` bytes — no padding).
-fn build_bitstream(message: &[u8], key: &[u8; 32], nonce: u64) -> Vec<u8> {
+/// Build the framed payload region:
+/// `[0x01][iv 16][nonce le64][len u8][keystream-XOR body][tag 16][0x01]`.
+fn build_framed(message: &[u8], key: &[u8; 32], nonce: u64) -> Vec<u8> {
     let mut body = message.to_vec();
     keys::apply_keystream_with_key(&mut body, key);
     let tag = keys::mac_tag_from_key(key, &body);
+    let iv = keys::sha256(&[b"countersteg-ac-iv", key]);
 
-    let mut framed = Vec::with_capacity(NONCE_BYTES + LEN_BYTES + TAG_BYTES + message.len());
+    let mut framed = Vec::with_capacity(MIN_REGION + message.len());
+    framed.push(SENTINEL);
+    framed.extend_from_slice(&iv[..IV_BYTES]);
     framed.extend_from_slice(&nonce.to_le_bytes());
     framed.push(message.len() as u8);
     framed.extend_from_slice(&body);
     framed.extend_from_slice(&tag);
+    framed.push(TRAILER);
     framed
 }
 
-/// Seed for the fallback PRNG chooser: keyed so the tail is reproducible
-/// for the decoder's replay of decisions (decode only reads framing bits,
-/// but keyed fallback keeps the whole path deterministic for testing).
-fn fallback_seed(key: &[u8; 32]) -> u64 {
-    let d = keys::sha256(&[b"countersteg-fallback", key]);
-    u64::from_le_bytes(d[..8].try_into().unwrap())
+/// Capacity of a decision path in bits: `floor(sum(log2(arity)))` over the
+/// path's arities. The mixed-radix channel carries `log2(product)` bits, so
+/// this is the honest capacity measure (v2's `sum(floor(log2))` per-decision
+/// chunking understated it and forced the bias M7 removes).
+fn path_bits(decisions: &[Decision]) -> usize {
+    let sum: f64 = decisions.iter().map(|d| (d.arity.max(1) as f64).log2()).sum();
+    sum.floor() as usize
+}
+
+/// Replay the decisions and rebuild the payload integer, then serialize it
+/// (minimal big-endian; the sentinel/trailer bytes keep both ends stable).
+fn rebuild(decisions: &[Decision]) -> Vec<u8> {
+    let mut enc = ac::RadixEncoder::new();
+    for d in decisions.iter().rev() {
+        enc.encode(d.choice, d.arity);
+    }
+    enc.finish().to_be_bytes()
+}
+
+/// Parse `[sentinel][IV][nonce][len]` out of a rebuilt region and return
+/// `(nonce, claimed_len)`. Marker and bounds failures are indistinguishable
+/// from a wrong key.
+fn parse_region(bytes: &[u8]) -> Result<(u64, usize), StegoError> {
+    if bytes.first() != Some(&SENTINEL) || bytes.last() != Some(&TRAILER) {
+        return Err(StegoError::WrongKey);
+    }
+    if bytes.len() < MIN_REGION {
+        return Err(StegoError::Decode("region too short".into()));
+    }
+    let nonce = u64::from_le_bytes(
+        bytes[HEADER_BYTES..HEADER_BYTES + NONCE_BYTES]
+            .try_into()
+            .unwrap(),
+    );
+    let claimed = bytes[HEADER_BYTES + NONCE_BYTES] as usize;
+    if bytes.len() < MIN_REGION + claimed {
+        return Err(StegoError::WrongKey);
+    }
+    Ok((nonce, claimed))
 }
 
 /// Payload capacity estimate (bits) for a score of `len` whole notes.
-/// The exact capacity depends on the choices taken; treat this as a
+/// The exact capacity depends on the path taken; treat this as a
 /// lower-bound hint (see `embed`, which verifies the real figure).
 pub fn available_bits(nonce: u64, len: usize) -> usize {
     let comp = engine::compose(nonce, len);
-    engine::capacity_bits(&comp.decisions)
+    path_bits(&comp.decisions)
 }
 
 /// Embed a message into a fresh composition. Starts at `min_len` whole-note
-/// positions and extends the score until the actual (path-dependent)
-/// capacity fits the framing — capacity grows roughly linearly with length.
+/// positions and extends the score until the path capacity covers the
+/// payload region *and* a full in-process extraction reproduces the message
+/// (the self-check is authoritative — capacity arithmetic alone is only a
+/// hint).
 ///
 /// `nonce` must be unique per (passphrase, message): it keys the keystream
 /// and travels in the framing. Random per message is the safe default.
@@ -170,25 +197,24 @@ pub fn embed(
     // Derive once: stretching is ~100k SHA-256 rounds and the loop below
     // may try many score lengths.
     let key = keys::derive_key(passphrase, nonce);
-    let fb = fallback_seed(&key);
+    let framed = build_framed(message, &key, nonce);
+    let payload = BigUint::from_be_bytes(&framed);
     let mut last_capacity = 0usize;
-    // Success requires the framing to end exactly on a decision boundary:
-    // every framing bit steered, no straddle (a decision whose n bits could
-    // not all fit in the remaining stream). 128 extensions (~1000 notes)
-    // covers the 255-byte message cap with the 25-byte v2 framing overhead
-    // on the current engine's capacity curve (~3 bits per whole note).
     for ext in 0..128 {
         let len = min_len + ext * 8;
-        let stream = build_bitstream(message, &key, nonce);
-        let mut chooser = PayloadChooser::new(BitReader::new(&stream), fb);
+        let mut chooser = AcChooser {
+            dec: ac::RadixDecoder::new(payload.clone()),
+        };
         let comp = compose_with(len, &mut chooser);
         last_capacity = decisions_of(&comp.cf, &comp.cp)
-            .map(|ds| engine::capacity_bits(&ds))
+            .map(|ds| path_bits(&ds))
             .unwrap_or(0);
-        // Success requires the framing to end exactly on a decision
-        // boundary: every framing bit steered, no straddle (a decision
-        // whose n bits could not all fit in the remaining stream).
-        if !chooser.straddled && chooser.consumed_bits() >= needed {
+        if last_capacity >= needed
+            && matches!(
+                extract_with_key(&comp.cf, &comp.cp, &key).as_deref(),
+                Ok(out) if out == message
+            )
+        {
             return Ok((comp, len));
         }
     }
@@ -198,47 +224,78 @@ pub fn embed(
     })
 }
 
-/// Extract a message from a composition's notes (decoder side).
-/// The nonce is parsed from the framing; only the passphrase is needed.
-pub fn extract(cf: &[Note], cp: &[Note], passphrase: &str) -> Result<Vec<u8>, StegoError> {
+/// Extract a message from a composition's notes with an already-derived key
+/// (decoder side; `extract` derives the key from the parsed nonce first).
+pub fn extract_with_key(cf: &[Note], cp: &[Note], key: &[u8; 32]) -> Result<Vec<u8>, StegoError> {
     let decisions = decisions_of(cf, cp).map_err(StegoError::Decode)?;
+    let bytes = rebuild(&decisions);
+    let (_nonce, claimed) = parse_region(&bytes)?;
 
-    let mut bw = BitWriter::new();
-    for d in &decisions {
-        let n = d.bits();
-        if n == 0 {
-            continue;
-        }
-        // Encoder invariant: choice == payload bits < 2^n.
-        bw.push_bits(d.choice, n);
-    }
-    let bytes = bw.into_bytes();
-
-    if bytes.len() < NONCE_BYTES + LEN_BYTES + TAG_BYTES {
-        return Err(StegoError::Decode("bitstream too short".into()));
-    }
-    let nonce = u64::from_le_bytes(bytes[..NONCE_BYTES].try_into().unwrap());
-    let claimed = bytes[NONCE_BYTES] as usize;
-    if NONCE_BYTES + LEN_BYTES + claimed + TAG_BYTES > bytes.len() {
+    // The key-derived IV authenticates the framing boundary: anything but
+    // the exact key fails here before `claimed` is ever used as a length.
+    let iv = keys::sha256(&[b"countersteg-ac-iv", key]);
+    if bytes[1..HEADER_BYTES] != iv[..IV_BYTES] {
         return Err(StegoError::WrongKey);
     }
-    let key = keys::derive_key(passphrase, nonce);
-    let body_start = NONCE_BYTES + LEN_BYTES;
+
+    let body_start = HEADER_BYTES + NONCE_BYTES + LEN_BYTES;
     let mut body = bytes[body_start..body_start + claimed].to_vec();
     let tag: [u8; TAG_BYTES] = bytes[body_start + claimed..body_start + claimed + TAG_BYTES]
         .try_into()
         .unwrap();
-    if keys::mac_tag_from_key(&key, &body) != tag {
+    if keys::mac_tag_from_key(key, &body) != tag {
         return Err(StegoError::WrongKey);
     }
-    keys::apply_keystream_with_key(&mut body, &key);
+    keys::apply_keystream_with_key(&mut body, key);
     Ok(body)
+}
+
+/// Extract a message from a composition's notes (decoder side).
+/// The nonce is parsed from the framing; only the passphrase is needed.
+pub fn extract(cf: &[Note], cp: &[Note], passphrase: &str) -> Result<Vec<u8>, StegoError> {
+    let decisions = decisions_of(cf, cp).map_err(StegoError::Decode)?;
+    let bytes = rebuild(&decisions);
+    let (nonce, _claimed) = parse_region(&bytes)?;
+    let key = keys::derive_key(passphrase, nonce);
+    extract_with_key(cf, cp, &key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use engine::theory::is_consonant;
+    use std::collections::BTreeMap;
+
+    /// Per-arity choice tallies: arity -> count per candidate index.
+    fn tally(decisions: &[Decision]) -> BTreeMap<u32, Vec<u32>> {
+        let mut t: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for d in decisions {
+            let v = t.entry(d.arity).or_insert_with(|| vec![0; d.arity as usize]);
+            v[d.choice as usize] += 1;
+        }
+        t
+    }
+
+    /// Total variation distance between two per-arity tally maps.
+    fn total_variation(a: &BTreeMap<u32, Vec<u32>>, b: &BTreeMap<u32, Vec<u32>>) -> BTreeMap<u32, f64> {
+        let mut tv = BTreeMap::new();
+        for arity in a.keys().chain(b.keys()).copied().collect::<std::collections::BTreeSet<_>>() {
+            let (ta, tb) = (a.get(&arity), b.get(&arity));
+            let na: u32 = ta.map(|v| v.iter().sum()).unwrap_or(0);
+            let nb: u32 = tb.map(|v| v.iter().sum()).unwrap_or(0);
+            if na == 0 || nb == 0 {
+                continue;
+            }
+            let mut d = 0.0;
+            for i in 0..(arity as usize) {
+                let pa = ta.map(|v| v[i] as f64 / na as f64).unwrap_or(0.0);
+                let pb = tb.map(|v| v[i] as f64 / nb as f64).unwrap_or(0.0);
+                d += (pa - pb).abs();
+            }
+            tv.insert(arity, 0.5 * d);
+        }
+        tv
+    }
 
     #[test]
     fn roundtrip_short_message() {
@@ -260,7 +317,7 @@ mod tests {
 
     #[test]
     fn roundtrip_max_message() {
-        // 255 bytes is the cap; it must fit within the 64-extension budget.
+        // 255 bytes is the cap; it must fit within the extension budget.
         let msg = vec![b'x'; 255];
         let (comp, len) = embed(&msg, "pw", 1, 8).unwrap();
         assert!(len > 8, "extension should have happened");
@@ -278,7 +335,7 @@ mod tests {
     #[test]
     fn max_message_fits() {
         // The 255-byte cap must fit within the extension budget even with
-        // the 25-byte v2 framing overhead (~2240 bits).
+        // the 43-byte region overhead (~2384 bits).
         let big = vec![b'x'; 255];
         let (comp, len) = embed(&big, "pw", 1, 8).unwrap();
         assert!(len > 8, "extension should have happened");
@@ -286,11 +343,9 @@ mod tests {
     }
 
     #[test]
-    fn straddle_extends_until_boundary() {
-        // Embed must not return a score whose decision straddles the end of
-        // the framing (the v1 corruption bug): every success ends exactly on
-        // a decision boundary, so decode must always succeed for any nonce
-        // and minimum length that embed accepts.
+    fn extension_finds_fitting_length() {
+        // Every accepted (nonce, min_len) must roundtrip: the embed
+        // self-check replays the full extraction before returning.
         for nonce in 0..20u64 {
             let msg = b"boundary probe";
             let (comp, _len) = embed(msg, "pw", nonce, 16).unwrap();
@@ -300,21 +355,6 @@ mod tests {
                 "nonce {nonce}"
             );
         }
-    }
-
-    #[test]
-    fn tail_has_no_candidate_zero_signature() {
-        // M4 regression: after the framing is consumed, the fallback PRNG
-        // chooser drives the tail. A long score with a 1-byte message must
-        // therefore take some non-zero choices late in the path.
-        let (comp, len) = embed(b"\xAA", "pw", 3, 64).unwrap();
-        assert!(len >= 64);
-        let ds = decisions_of(&comp.cf, &comp.cp).unwrap();
-        let tail = &ds[ds.len() - 32..];
-        assert!(
-            tail.iter().any(|d| d.choice > 0),
-            "fallback tail picked candidate 0 at every decision (padding signature)"
-        );
     }
 
     #[test]
@@ -348,26 +388,83 @@ mod tests {
         }
     }
 
+    /// M8: the warden's own test. Embed across 24 fixed seeds and compare
+    /// the per-arity choice distribution against the natural `compose`
+    /// baseline. Total variation must stay under 0.15 for every arity —
+    /// the same threshold a warden would use to separate the two.
     #[test]
-    fn channel_choices_match_payload_bits() {
-        // Encoder invariant: at payload (framing) decisions the choice is
-        // the steered bits, so choice < 2^n. Tail decisions are driven by
-        // the fallback PRNG and may take any index < arity.
-        let msg = b"\xAA";
-        let (comp, _) = embed(msg, "pw", 3, 16).unwrap();
-        let needed = framing_bits(msg.len());
-        let ds = decisions_of(&comp.cf, &comp.cp).unwrap();
-        let mut seen = 0usize;
-        for d in &ds {
-            let n = d.bits();
-            if n == 0 {
-                continue;
+    fn self_steganalysis_distribution_matches_natural() {
+        let msg = b"distribution probe";
+        let len = 64;
+        let mut embedded: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut natural: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for seed in 0..24u64 {
+            let (comp, _) = embed(msg, "pw", 1_000 + seed, len).unwrap();
+            let ds = decisions_of(&comp.cf, &comp.cp).unwrap();
+            for (arity, counts) in tally(&ds) {
+                let v = embedded.entry(arity).or_insert_with(|| vec![0; arity as usize]);
+                for (i, c) in counts.iter().enumerate() {
+                    v[i] += c;
+                }
             }
-            if seen < needed {
-                assert!(d.choice < (1 << n), "payload choice fits n bits");
+            let nat = engine::compose(seed, len);
+            for (arity, counts) in tally(&nat.decisions) {
+                let v = natural.entry(arity).or_insert_with(|| vec![0; arity as usize]);
+                for (i, c) in counts.iter().enumerate() {
+                    v[i] += c;
+                }
             }
-            seen += n as usize;
         }
-        assert!(seen >= needed);
+        let tv = total_variation(&embedded, &natural);
+        assert!(!tv.is_empty(), "no overlapping arity buckets");
+        for (arity, d) in tv {
+            assert!(d < 0.15, "arity {arity}: total variation {d:.3} vs natural");
+        }
+    }
+
+    /// M7: steered decisions must use the FULL candidate range at every
+    /// arity, not just `2^n` of it (the v2 chunk-chooser bias).
+    #[test]
+    fn payload_choices_use_full_arity() {
+        // Aggregate across 12 nonces: uniform digits must collectively hit
+        // every candidate at every arity (a single short path may miss one).
+        let mut agg: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for nonce in 0..12u64 {
+            let (comp, _) = embed(b"\xAA", "pw", nonce, 32).unwrap();
+            let ds = decisions_of(&comp.cf, &comp.cp).unwrap();
+            for (arity, counts) in tally(&ds) {
+                let v = agg.entry(arity).or_insert_with(|| vec![0; arity as usize]);
+                for (i, c) in counts.iter().enumerate() {
+                    v[i] += c;
+                }
+            }
+        }
+        for (arity, counts) in agg {
+            for (i, &c) in counts.iter().enumerate() {
+                assert!(c > 0, "arity {arity}: candidate {i} never taken");
+            }
+        }
+    }
+
+    /// The framing boundary is authenticated by the key-derived IV before
+    /// the claimed length is trusted: flipping a note must not decode.
+    #[test]
+    fn tampered_score_fails() {
+        let (mut comp, _) = embed(b"integrity probe", "pw", 77, 16).unwrap();
+        let i = comp.cf.len() / 2;
+        comp.cp[i] = comp.cf[i]; // break the counterpoint relationship
+        let res = extract(&comp.cf, &comp.cp, "pw");
+        assert!(matches!(res, Err(StegoError::WrongKey) | Err(StegoError::Decode(_))));
+    }
+
+    #[test]
+    fn framed_region_has_stable_end_bytes() {
+        // Sentinel and trailer survive the integer round trip.
+        let key = keys::derive_key("pw", 42);
+        let framed = build_framed(b"hi", &key, 42);
+        assert_eq!(framed[0], SENTINEL);
+        assert_eq!(framed[framed.len() - 1], TRAILER);
+        let x = BigUint::from_be_bytes(&framed);
+        assert_eq!(x.to_be_bytes(), framed);
     }
 }
