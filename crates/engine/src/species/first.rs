@@ -92,16 +92,24 @@ fn cp_rule_ok(cf: Note, cp: Note, prev_cp: Option<Note>, pos: u32, len: u32, str
 /// Candidate notes for the counterpoint at position `i`, given all CF notes
 /// and the counterpoint notes at positions `< i`. Mirrors the generation
 /// path exactly (single-voice rules + motion rules + boundary fallbacks).
-fn cp_step_candidates(cf: &[Note], cp_prefix: &[Note], i: usize, len: usize) -> Vec<Note> {
+///
+/// Species-independent given the previous *sounding* CP note: `species::second`
+/// reuses this verbatim for downbeats on the half-note grid, where
+/// `cp_prefix` is the flat half-note list and `cp_prefix.last()` is the
+/// upbeat of position `i - 1`.
+pub(crate) fn cp_step_candidates(cf: &[Note], cp_prefix: &[Note], i: usize, len: usize) -> Vec<Note> {
     let cf_note = cf[i];
     let pos = i as u32;
     let len = len as u32;
     let prev_cp = cp_prefix.last().copied();
-    let prev_interval = if i > 0 {
-        Some(Note::semitone_distance(cf[i - 1], cp_prefix[i - 1]))
-    } else {
-        None
-    };
+    // Interval sounding at the end of the previous position: the last note
+    // of the prefix. (For species-1 prefixes len == i so this equals
+    // cp_prefix[i - 1]; on the species-2 half-note grid the last note is the
+    // upbeat of position i - 1, which is the note actually sounding against
+    // cf[i - 1]. Using .last() is correct for both.)
+    let prev_interval = cp_prefix
+        .last()
+        .map(|n| Note::semitone_distance(cf[i - 1], *n));
 
     let mut cands = cp_candidates(cf_note, prev_cp, pos, len);
 
