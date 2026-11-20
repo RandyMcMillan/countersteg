@@ -7,3 +7,6 @@ license = "MIT"
 
 [dependencies]
 entropy = { path = "../entropy" }
+
+[dev-dependencies]
+sha2 = "0.10"

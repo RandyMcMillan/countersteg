@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Keystream PRNG, Shannon entropy, stream health stats"
 license = "MIT"
+
+[dev-dependencies]
+rand_xoshiro = "0.6"
+rand_core = "0.6"
