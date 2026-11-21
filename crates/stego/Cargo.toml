@@ -1,6 +1,6 @@
 [package]
 name = "stego"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Selection-channel steganography over composer decision points"
 license = "MIT"
