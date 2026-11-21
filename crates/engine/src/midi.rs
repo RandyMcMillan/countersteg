@@ -4,6 +4,7 @@
 use crate::composer::TICKS_PER_NOTE;
 use crate::species::first::Composition;
 use crate::species::second::Composition2;
+use crate::theory::Note;
 
 /// Half-note duration in ticks (second-species CP voice).
 const TICKS_PER_HALF: u32 = TICKS_PER_NOTE / 2;
@@ -69,6 +70,36 @@ pub struct SmfData {
     pub track_name: Option<String>,
 }
 
+impl SmfData {
+    /// Convert to engine notes, handling both species. First-species files
+    /// convert directly. Second-species files need the flat half-note CP
+    /// list rebuilt: `read_smf` returns the *sounded* list (2*len-2
+    /// entries, the repeated boundary upbeats omitted), while the decoder
+    /// replay expects the full 2*len list with the repeats restored —
+    /// `[a0, a0, a1, b1, ..., a_last, a_last]`. Returns None if a pitch is
+    /// not a diatonic note or the voice lengths fit neither species.
+    pub fn to_notes(&self) -> Option<(Vec<Note>, Vec<Note>)> {
+        let cf: Vec<Note> = self.cf.iter().map(|&m| Note::from_midi(m)).collect::<Option<_>>()?;
+        let cp: Vec<Note> = if self.cp.len() == cf.len() {
+            self.cp.iter().map(|&m| Note::from_midi(m)).collect::<Option<_>>()?
+        } else if cf.len() >= 4 && self.cp.len() == 2 * cf.len() - 2 {
+            let sounded: Vec<Note> =
+                self.cp.iter().map(|&m| Note::from_midi(m)).collect::<Option<_>>()?;
+            // flat = [s0, s0, s1..s_last, s_last]: restore both boundary
+            // whole-note repeats the sounded list omits.
+            let mut flat = Vec::with_capacity(2 * cf.len());
+            flat.push(sounded[0]);
+            flat.push(sounded[0]);
+            flat.extend_from_slice(&sounded[1..]);
+            flat.push(*sounded.last().unwrap());
+            flat
+        } else {
+            return None;
+        };
+        Some((cf, cp))
+    }
+}
+
 fn read_varlen(b: &[u8], i: &mut usize) -> Option<u32> {
     let mut v: u32 = 0;
     for _ in 0..5 {
@@ -89,7 +120,7 @@ pub fn read_smf(bytes: &[u8]) -> Result<SmfData, String> {
         return Err("not a MIDI file (bad MThd)".into());
     }
     let hdr_len = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    let ntracks = u16::from_be_bytes(bytes[10..12].try_into().unwrap());
+    let ntracks = u16::from_be_bytes(bytes[10..12].try_into().unwrap()) as usize;
     if ntracks != 1 {
         return Err("expected format 0 (single track)".into());
     }
@@ -334,5 +365,22 @@ mod tests {
             .collect();
         assert_eq!(data.cp, sounded);
         assert_eq!(data.track_name.as_deref(), Some("seed:7"));
+    }
+
+    #[test]
+    fn smf2_to_notes_rebuilds_flat_cp() {
+        // Extraction replays the full 2*len half-note list; to_notes must
+        // restore the boundary repeats read_smf omits.
+        let comp = crate::species::second::compose2(3, 10);
+        let data = read_smf(&write_smf2(&comp)).unwrap();
+        let (cf, cp) = data.to_notes().unwrap();
+        assert_eq!(cf, comp.cf);
+        assert_eq!(cp, comp.cp);
+        // First-species files convert directly.
+        let comp1 = compose(3, 10);
+        let data1 = read_smf(&write_smf(&comp1)).unwrap();
+        let (cf1, cp1) = data1.to_notes().unwrap();
+        assert_eq!(cf1, comp1.cf);
+        assert_eq!(cp1, comp1.cp);
     }
 }
