@@ -7,6 +7,7 @@
 //!
 //! Single-threaded model: the output buffer is a plain `static mut`.
 #![allow(static_mut_refs)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::slice;
 
@@ -58,9 +59,12 @@ unsafe fn input_string(ptr: *const u8, len: usize) -> String {
     String::from_utf8_lossy(input(ptr, len)).into_owned()
 }
 
+/// FFI-safety note: the `*const u8` arguments below are raw pointers into
+/// wasm linear memory; every operation copies what it needs before
+/// returning, and JS must keep the input alive only for the call itself.
 fn cf_cp_from_midi(data: &engine::SmfData) -> Result<(Vec<engine::Note>, Vec<engine::Note>), String> {
-    let cf: Option<Vec<engine::Note>> = data.cf.iter().map(|&m| engine::Note::from_midi(m)).collect();
-    let cp: Option<Vec<engine::Note>> = data.cp.iter().map(|&m| engine::Note::from_midi(m)).collect();
+    let cf: Option<Vec<engine::Note>> = data.to_notes(true);
+    let cp: Option<Vec<engine::Note>> = data.to_notes(false);
     match (cf, cp) {
         (Some(a), Some(b)) => Ok((a, b)),
         _ => Err("non-diatonic note in MIDI".into()),
@@ -90,6 +94,28 @@ pub extern "C" fn embed_midi(
     let (message, passphrase) = unsafe { (input(msg_ptr, msg_len), input_string(pass_ptr, pass_len)) };
     match stego::embed(message, &passphrase, seed, min_len.max(4)) {
         Ok((comp, _)) => ok(engine::write_smf_named(&comp, None)),
+        Err(e) => fail(e.to_string()),
+    }
+}
+
+/// Embed a message as a chosen species (1 = first, 2 = second). On success
+/// returns 0 and OUTPUT holds SMF bytes. Species 2 doubles the
+/// selection-channel arity (two CP decisions per whole note) and uses the
+/// v0.3 framing (species-tagged). Other species values are rejected.
+#[no_mangle]
+pub extern "C" fn embed_midi_species(
+    msg_ptr: *const u8,
+    msg_len: usize,
+    pass_ptr: *const u8,
+    pass_len: usize,
+    seed: u64,
+    min_len: usize,
+    species: u8,
+) -> i32 {
+    let (message, passphrase) = unsafe { (input(msg_ptr, msg_len), input_string(pass_ptr, pass_len)) };
+    match stego::embed_species(message, &passphrase, seed, min_len.max(4), species) {
+        Ok(stego::Embedded::First(comp)) => ok(engine::write_smf_named(&comp, None)),
+        Ok(stego::Embedded::Second(comp)) => ok(engine::write_smf2_named(&comp, None)),
         Err(e) => fail(e.to_string()),
     }
 }
@@ -179,6 +205,11 @@ fn synth_note(buf: &mut [f32], start: usize, dur: usize, midi: u8, voice: u8, sr
 
 /// Render a countersteg SMF to mono f32 PCM at `sample_rate` Hz.
 /// On success returns 0 and OUTPUT holds `4 * n` little-endian f32 bytes.
+///
+/// Timing note: rendering assumes the whole-note grid of first species.
+/// Second-species files (half-note CP grid) render with CP notes placed
+/// at whole-note boundaries — playback timing is approximate there; the
+/// embed/extract paths are unaffected.
 #[no_mangle]
 pub extern "C" fn render_midi(midi_ptr: *const u8, midi_len: usize, sample_rate: u32) -> i32 {
     let bytes = unsafe { input(midi_ptr, midi_len) };
@@ -277,6 +308,81 @@ mod tests {
         unsafe { std::ptr::copy_nonoverlapping(junk.as_ptr(), p, junk.len()) };
         let rc = render_midi(p, junk.len(), 44_100);
         dealloc(p, junk.len());
+        assert_eq!(rc, 1);
+        assert_eq!(is_error(), 1);
+    }
+
+    fn call_embed(msg: &[u8], pass: &str, seed: u64, min_len: usize) -> (i32, Vec<u8>) {
+        let _g = LOCK.lock().unwrap();
+        let mp = alloc(msg.len());
+        unsafe { std::ptr::copy_nonoverlapping(msg.as_ptr(), mp, msg.len()) };
+        let pp = alloc(pass.len());
+        unsafe { std::ptr::copy_nonoverlapping(pass.as_ptr(), pp, pass.len()) };
+        let rc = embed_midi(mp, msg.len(), pp, pass.len(), seed, min_len);
+        let out = unsafe { slice::from_raw_parts(output_ptr(), output_len()) }.to_vec();
+        dealloc(mp, msg.len());
+        dealloc(pp, pass.len());
+        (rc, out)
+    }
+
+    fn call_extract(bytes: &[u8], pass: &str) -> (i32, Vec<u8>) {
+        let _g = LOCK.lock().unwrap();
+        let bp = alloc(bytes.len());
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), bp, bytes.len()) };
+        let pp = alloc(pass.len());
+        unsafe { std::ptr::copy_nonoverlapping(pass.as_ptr(), pp, pass.len()) };
+        let rc = extract_message(bp, bytes.len(), pp, pass.len());
+        let out = unsafe { slice::from_raw_parts(output_ptr(), output_len()) }.to_vec();
+        dealloc(bp, bytes.len());
+        dealloc(pp, pass.len());
+        (rc, out)
+    }
+
+    #[test]
+    fn call_embed_and_extract() {
+        let msg = b"ffi roundtrip";
+        let (rc, smf) = call_embed(msg, "pw", 42, 16);
+        assert_eq!(rc, 0);
+        let (rc, out) = call_extract(&smf, "pw");
+        assert_eq!(rc, 0);
+        assert_eq!(out, msg);
+    }
+
+    fn call_embed_species(
+        msg: &[u8],
+        pass: &str,
+        seed: u64,
+        min_len: usize,
+        species: u8,
+    ) -> (i32, Vec<u8>) {
+        let _g = LOCK.lock().unwrap();
+        let mp = alloc(msg.len());
+        unsafe { std::ptr::copy_nonoverlapping(msg.as_ptr(), mp, msg.len()) };
+        let pp = alloc(pass.len());
+        unsafe { std::ptr::copy_nonoverlapping(pass.as_ptr(), pp, pass.len()) };
+        let rc = embed_midi_species(mp, msg.len(), pp, pass.len(), seed, min_len, species);
+        let out = unsafe { slice::from_raw_parts(output_ptr(), output_len()) }.to_vec();
+        dealloc(mp, msg.len());
+        dealloc(pp, pass.len());
+        (rc, out)
+    }
+
+    #[test]
+    fn embed_species_roundtrips_through_extract() {
+        let msg = b"species ffi";
+        for species in [1u8, 2] {
+            let (rc, smf) = call_embed_species(msg, "pw", 42, 16, species);
+            assert_eq!(rc, 0, "embed species {species} failed");
+            let (rc, out) = call_extract(&smf, "pw");
+            assert_eq!(rc, 0, "extract species {species} failed");
+            assert_eq!(out, msg, "species {species} roundtrip");
+        }
+    }
+
+    #[test]
+    fn embed_midi_species_rejects_bad_species() {
+        let msg = b"species ffi";
+        let (rc, _out) = call_embed_species(msg, "pw", 42, 16, 3);
         assert_eq!(rc, 1);
         assert_eq!(is_error(), 1);
     }
