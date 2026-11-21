@@ -25,6 +25,15 @@
 //! The key-derived IV authenticates the framing boundary before the claimed
 //! length is trusted: a wrong key fails here, not on a length check.
 //!
+//! Species dispatch: `embed` steers first-species whole-note counterpoint
+//! (v0.2 behavior, unchanged). `embed_species(.., Species::Second)` steers
+//! second-species half-note counterpoint instead — two selection-channel
+//! decisions per position, roughly 1.5x the capacity at the same bar count.
+//! Extraction auto-detects the species from voice geometry
+//! (`cp.len() == cf.len()` vs `2 * cf.len()`), so no species argument is
+//! ever needed on the decoder side. Species 1 is permanent: no deprecation,
+//! no default swap; species 2 is strictly opt-in per embed.
+//!
 //! M9 error correction (active-warden case): `embed_with_ecc` wraps the
 //! region as `[0x02][region x3]` — extraction majority-votes the three
 //! copies, so any single-byte corruption of the payload integer is
@@ -69,6 +78,7 @@
 //! corruption is repaired while multi-byte corruption still fails closed
 //! at the MAC rather than decoding garbage.
 
+use engine::species::second::{compose_with2, decisions_of2, Composition2};
 use engine::{compose_with, decisions_of, Chooser, Composition, Decision, Note};
 
 mod ac;
@@ -128,6 +138,59 @@ pub const TRAILER: u8 = 0x01;
 pub const HEADER_BYTES: usize = 1 + IV_BYTES;
 /// smallest possible region: header + nonce + len + tag + trailer.
 pub const MIN_REGION: usize = HEADER_BYTES + NONCE_BYTES + LEN_BYTES + TAG_BYTES + 1;
+
+/// Counterpoint species: the rule set the CP voice follows. `First` is the
+/// v0.2 behavior (whole-note counterpoint, v0.2 framing). `Second` steers
+/// the two half notes per position and (see `embed_species`) uses the v0.3
+/// framing. Extraction never takes a species argument: the voice geometry
+/// (`cp.len()` vs `cf.len()`) disambiguates, and the v0.3 framing carries a
+/// species byte cross-checked against that geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Species {
+    First,
+    Second,
+}
+
+/// The steered composition returned by `embed_species`. Callers persist it
+/// with `write_smf_named` / `write_smf2_named` (no identifying metadata).
+#[derive(Debug)]
+pub enum Embedded {
+    First(Composition),
+    Second(Composition2),
+}
+
+/// Species implied by voice geometry: `cp.len() == cf.len()` -> first,
+/// `cp.len() == 2 * cf.len()` -> second. Any other ratio is not a
+/// countersteg cover (or is corrupt).
+fn detect_species(cf: &[Note], cp: &[Note]) -> Option<Species> {
+    if cp.len() == cf.len() {
+        Some(Species::First)
+    } else if cp.len() == 2 * cf.len() {
+        Some(Species::Second)
+    } else {
+        None
+    }
+}
+
+/// Replay decisions under the species the voice geometry implies.
+fn decisions_for(cf: &[Note], cp: &[Note]) -> Result<Vec<Decision>, String> {
+    match detect_species(cf, cp) {
+        Some(Species::First) => decisions_of(cf, cp),
+        Some(Species::Second) => decisions_of2(cf, cp),
+        None => Err(format!(
+            "cp/cf length ratio {}:{} is not a known species",
+            cp.len(),
+            cf.len()
+        )),
+    }
+}
+
+/// Replay the decisions of a cover, auto-detecting the species from voice
+/// geometry. Public for stats/introspection tools; `extract` uses the same
+/// path.
+pub fn replay_decisions(cf: &[Note], cp: &[Note]) -> Result<Vec<Decision>, String> {
+    decisions_for(cf, cp)
+}
 
 /// M9: marks a triplicated region `[0x02][region x3]`; decode majority-votes.
 pub const EC_SENTINEL: u8 = 0x02;
@@ -236,8 +299,72 @@ fn parse_region(bytes: &[u8]) -> Result<(u64, usize), StegoError> {
 /// The exact capacity depends on the path taken; treat this as a
 /// lower-bound hint (see `embed`, which verifies the real figure).
 pub fn available_bits(nonce: u64, len: usize) -> usize {
-    let comp = engine::compose(nonce, len);
-    path_bits(&comp.decisions)
+    available_bits_species(nonce, len, Species::First)
+}
+
+/// Like `available_bits`, for either species. Second species carries the
+/// two CP beats per position as separate decisions, so its channel is
+/// roughly 1.5x wider at the same bar count.
+pub fn available_bits_species(nonce: u64, len: usize, species: Species) -> usize {
+    match species {
+        Species::First => path_bits(&engine::compose(nonce, len).decisions),
+        Species::Second => path_bits(&engine::species::second::compose2(nonce, len).decisions),
+    }
+}
+
+/// Extend the score from `min_len` until the steered path covers `needed`
+/// bits *and* a full in-process extraction reproduces the message (the
+/// self-check is authoritative — capacity arithmetic alone is only a hint).
+/// Fails with precise capacity after 128 extensions.
+fn embed_loop(
+    payload: &BigUint,
+    key: &[u8; 32],
+    message: &[u8],
+    needed: usize,
+    min_len: usize,
+    species: Species,
+) -> Result<(Embedded, usize), StegoError> {
+    let mut last_capacity = 0usize;
+    for ext in 0..128 {
+        let len = min_len + ext * 8;
+        let mut chooser = AcChooser {
+            dec: ac::RadixDecoder::new(payload.clone()),
+        };
+        match species {
+            Species::First => {
+                let comp = compose_with(len, &mut chooser);
+                last_capacity = decisions_of(&comp.cf, &comp.cp)
+                    .map(|ds| path_bits(&ds))
+                    .unwrap_or(0);
+                if last_capacity >= needed
+                    && matches!(
+                        extract_with_key(&comp.cf, &comp.cp, key).as_deref(),
+                        Ok(out) if out == message
+                    )
+                {
+                    return Ok((Embedded::First(comp), len));
+                }
+            }
+            Species::Second => {
+                let comp = compose_with2(len, &mut chooser);
+                last_capacity = decisions_of2(&comp.cf, &comp.cp)
+                    .map(|ds| path_bits(&ds))
+                    .unwrap_or(0);
+                if last_capacity >= needed
+                    && matches!(
+                        extract_with_key(&comp.cf, &comp.cp, key).as_deref(),
+                        Ok(out) if out == message
+                    )
+                {
+                    return Ok((Embedded::Second(comp), len));
+                }
+            }
+        }
+    }
+    Err(StegoError::CapacityExceeded {
+        needed_bits: needed,
+        capacity_bits: last_capacity,
+    })
 }
 
 /// Embed a message into a fresh composition. Starts at `min_len` whole-note
@@ -258,77 +385,76 @@ pub fn embed(
     nonce: u64,
     min_len: usize,
 ) -> Result<(Composition, usize), StegoError> {
-    embed_inner(message, passphrase, nonce, min_len, false)
+    if message.len() > 255 {
+        return Err(StegoError::Decode("message exceeds 255 bytes".into()));
+    }
+    // Derive once: stretching is ~100k SHA-256 rounds and the loop below
+    // may try many score lengths.
+    let key = keys::derive_key(passphrase, nonce);
+    let framed = build_framed(message, &key, nonce);
+    let payload = BigUint::from_be_bytes(&framed);
+    match embed_loop(&payload, &key, message, framing_bits(message.len()), min_len, Species::First)? {
+        (Embedded::First(comp), len) => Ok((comp, len)),
+        _ => unreachable!("embed is species-1 only"),
+    }
+}
+
+/// Second-species embed: like `embed`, but the CP voice carries two half
+/// notes per position (see `engine::species::second`), roughly 1.5x the
+/// channel capacity at the same bar count. Persist with
+/// `write_smf2_named(.., None)`.
+pub fn embed_species(
+    message: &[u8],
+    passphrase: &str,
+    nonce: u64,
+    min_len: usize,
+    species: Species,
+) -> Result<(Embedded, usize), StegoError> {
+    if message.len() > 255 {
+        return Err(StegoError::Decode("message exceeds 255 bytes".into()));
+    }
+    let key = keys::derive_key(passphrase, nonce);
+    let framed = build_framed(message, &key, nonce);
+    let payload = BigUint::from_be_bytes(&framed);
+    embed_loop(
+        &payload,
+        &key,
+        message,
+        framing_bits(message.len()),
+        min_len,
+        species,
+    )
 }
 
 /// M9: like `embed`, but the region is triplicated so that extraction
 /// survives any single-byte corruption of the payload integer (majority
 /// vote). Costs 3x capacity; message cap is `EC_MAX_MESSAGE` (64 bytes).
+/// ECC regions stay in the v0.2 species-1 format (decision D3).
 pub fn embed_with_ecc(
     message: &[u8],
     passphrase: &str,
     nonce: u64,
     min_len: usize,
 ) -> Result<(Composition, usize), StegoError> {
-    embed_inner(message, passphrase, nonce, min_len, true)
-}
-
-fn embed_inner(
-    message: &[u8],
-    passphrase: &str,
-    nonce: u64,
-    min_len: usize,
-    ecc: bool,
-) -> Result<(Composition, usize), StegoError> {
-    let max_msg = if ecc { EC_MAX_MESSAGE } else { 255 };
-    if message.len() > max_msg {
+    if message.len() > EC_MAX_MESSAGE {
         return Err(StegoError::Decode(format!(
-            "message exceeds {max_msg} bytes"
+            "message exceeds {EC_MAX_MESSAGE} bytes"
         )));
     }
-    let needed = if ecc {
-        (1 + 3 * (MIN_REGION + message.len())) * 8
-    } else {
-        framing_bits(message.len())
-    };
-    // Derive once: stretching is ~100k SHA-256 rounds and the loop below
-    // may try many score lengths.
     let key = keys::derive_key(passphrase, nonce);
-    let framed = if ecc {
-        build_framed_ec(message, &key, nonce)
-    } else {
-        build_framed(message, &key, nonce)
-    };
+    let framed = build_framed_ec(message, &key, nonce);
     let payload = BigUint::from_be_bytes(&framed);
-    let mut last_capacity = 0usize;
-    for ext in 0..128 {
-        let len = min_len + ext * 8;
-        let mut chooser = AcChooser {
-            dec: ac::RadixDecoder::new(payload.clone()),
-        };
-        let comp = compose_with(len, &mut chooser);
-        last_capacity = decisions_of(&comp.cf, &comp.cp)
-            .map(|ds| path_bits(&ds))
-            .unwrap_or(0);
-        if last_capacity >= needed
-            && matches!(
-                extract_with_key(&comp.cf, &comp.cp, &key).as_deref(),
-                Ok(out) if out == message
-            )
-        {
-            return Ok((comp, len));
-        }
+    let needed = (1 + 3 * (MIN_REGION + message.len())) * 8;
+    match embed_loop(&payload, &key, message, needed, min_len, Species::First)? {
+        (Embedded::First(comp), len) => Ok((comp, len)),
+        _ => unreachable!("ECC embed is species-1 only"),
     }
-    Err(StegoError::CapacityExceeded {
-        needed_bits: needed,
-        capacity_bits: last_capacity,
-    })
 }
 
 /// Extract a message from a composition's notes with an already-derived key
 /// (decoder side; `extract` derives the key from the parsed nonce first).
 pub fn extract_with_key(cf: &[Note], cp: &[Note], key: &[u8; 32]) -> Result<Vec<u8>, StegoError> {
-    let decisions = decisions_of(cf, cp).map_err(StegoError::Decode)?;
+    let decisions = decisions_for(cf, cp).map_err(StegoError::Decode)?;
     let bytes = unwrap_ec(&rebuild(&decisions))?;
     let (_nonce, claimed) = parse_region(&bytes)?;
 
@@ -354,7 +480,7 @@ pub fn extract_with_key(cf: &[Note], cp: &[Note], key: &[u8; 32]) -> Result<Vec<
 /// Extract a message from a composition's notes (decoder side).
 /// The nonce is parsed from the framing; only the passphrase is needed.
 pub fn extract(cf: &[Note], cp: &[Note], passphrase: &str) -> Result<Vec<u8>, StegoError> {
-    let decisions = decisions_of(cf, cp).map_err(StegoError::Decode)?;
+    let decisions = decisions_for(cf, cp).map_err(StegoError::Decode)?;
     let bytes = unwrap_ec(&rebuild(&decisions))?;
     let (nonce, _claimed) = parse_region(&bytes)?;
     let key = keys::derive_key(passphrase, nonce);
@@ -397,7 +523,7 @@ pub fn embed_split(
         payload.push(count as u8);
         payload.push(part.len() as u8);
         payload.extend_from_slice(part);
-        let (comp, _) = embed_inner(&payload, passphrase, nonce.wrapping_add(i as u64), min_len, false)?;
+        let (comp, _) = embed(&payload, passphrase, nonce.wrapping_add(i as u64), min_len)?;
         comps.push(comp);
     }
     Ok(comps)
@@ -531,6 +657,44 @@ mod tests {
             let out = extract(&comp.cf, &comp.cp, "s3cret").unwrap();
             assert_eq!(out, msg, "nonce {nonce}");
         }
+    }
+
+    #[test]
+    fn roundtrip_species2() {
+        // Auto-detection proof: extract() takes no species argument; the
+        // voice geometry (cp.len() == 2 * cf.len()) drives the replay.
+        let msg = b"second species payload";
+        let (comp, len) = embed_species(msg, "pw", 42, 16, Species::Second).unwrap();
+        let (cf, cp) = match &comp {
+            Embedded::First(_) => panic!("expected a second-species composition"),
+            Embedded::Second(c) => (c.cf.clone(), c.cp.clone()),
+        };
+        assert_eq!(cp.len(), 2 * cf.len());
+        assert_eq!(extract(&cf, &cp, "pw").unwrap(), msg);
+        assert_eq!(extract_with_key(&cf, &cp, &keys::derive_key("pw", 42)).unwrap(), msg);
+        let _ = len;
+    }
+
+    #[test]
+    fn species2_capacity_exceeds_species1() {
+        // Same bar count, both species: the half-note grid is strictly wider.
+        for nonce in 0..8u64 {
+            for len in [8usize, 16, 32] {
+                let s1 = available_bits_species(nonce, len, Species::First);
+                let s2 = available_bits_species(nonce, len, Species::Second);
+                assert!(s2 > s1, "nonce {nonce} len {len}: species2 {s2} <= species1 {s1}");
+            }
+        }
+    }
+
+    #[test]
+    fn replay_rejects_unknown_geometry() {
+        // cp lengths that match neither species are a decode error, not a
+        // panic or a mis-dispatch.
+        let cf: Vec<Note> = engine::compose(1, 8).cf;
+        let short_cp: Vec<Note> = engine::compose(1, 8).cp[..7].to_vec();
+        let res = extract(&cf, &short_cp, "pw");
+        assert!(matches!(res, Err(StegoError::Decode(_))));
     }
 
     #[test]
