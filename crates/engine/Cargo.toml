@@ -2,8 +2,7 @@
 name = "engine"
 version = "0.3.2"
 edition = "2021"
-description = "Markov-counterpoint hybrid composition engine"
+description = "Markov-counterpoint hybrid composition engine (first-species Fuxian rules)"
 license = "MIT"
 
 [dependencies]
-rand_xoshiro = "0.6"
