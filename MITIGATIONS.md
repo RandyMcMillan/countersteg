@@ -118,6 +118,14 @@ and the CLI follow.
   asserts every arity bucket sees its full candidate range across 12
   nonces. M7 is done when the warden's own test cannot separate embedded
   from natural.
+  - Species 2 extension (`self_steganalysis_distribution_matches_natural_species2`):
+    the same warden test against the second-species generator and its own
+    bound (< 0.20 per arity; measured peak ≈ 0.14 at len 64, forced
+    arity-1 buckets at 0.0000). Species 2 needs its own bound because its
+    arity histogram shifts — boundary upbeats are forced arity-1
+    singletons and upbeat beats admit passing tones — so a shared
+    threshold would either over-tighten species 1 or under-tighten
+    species 2. The species-1 test and its 0.15 bound are unchanged.
 
 ### P3 — robustness (implemented)
 
@@ -136,6 +144,57 @@ and the CLI follow.
   255-byte cap no longer bounds the message. Reassembly requires every shard
   exactly once with consistent totals — a withheld or substituted shard is
   detectable.
+
+## Species 2 and framing v0.3 — additive capacity channel
+
+Species 2 (second-species counterpoint: two half notes against each CF
+whole note) is a strictly additive, opt-in capacity channel. Species 1 is
+permanent — no deprecation, no replacement, no default swap — and all
+v0.2.0 covers remain readable forever.
+
+### Framing versions
+
+| Sentinel | Layout | Emitted by |
+|---|---|---|
+| `0x01` (v0.2) | `[IV 16][nonce 8][len 1][ct][MAC 16]` | `embed` (species-1), unchanged |
+| `0x02` (ECC) | `[0x02][v0.2 region × 3]` | `embed_with_ecc` — species-1 only (decision D3), unchanged |
+| `0x03` (v0.3) | `[IV 16][nonce 8][species 1][len 1][ct][MAC 16]` | `embed_species` only |
+
+The v0.3 species byte is `0x01` (first) or `0x02` (second). Extraction
+dispatches on the sentinel pair, then cross-checks the declared species
+against voice geometry (`cp.len() == cf.len()` → species 1, `2 * cf.len()`
+→ species 2) before the MAC is verified — a species-byte flip fails
+indistinguishably from `WrongKey`. The IV domain is version-separated
+(`countersteg-ac-iv` vs `countersteg-ac-iv-v3`), so a v0.2 frame can never
+be replayed as v0.3 under the same key. `embed_split` shards through the
+unchanged species-1 `embed` path.
+
+### Selection-channel arity shift
+
+Species 2 replays `3*len - 1` decisions per score vs `2*len - 1` for
+species 1, but the arity *histogram* moves, not just its size: boundary
+upbeats are forced arity-1 (zero-bit) singletons, and upbeat beats that
+carry a passing tone have smaller candidate sets than consonant beats.
+The M8 warden test therefore runs per species with per-species TV bounds
+(0.15 species 1, 0.20 species 2); measured species-2 variation peaks
+≈ 0.14 at len 64 over 24 nonces, with every forced-decision bucket
+(arity 1) exactly at 0.0000.
+
+### Capacity (measured)
+
+`capacity_bits` averaged over seeds 0..16:
+
+| len (bars) | species-1 bits | bits/bar | species-2 bits | bits/bar | gain |
+|---|---|---|---|---|---|
+| 8  | 19  | 2 | 28  | 3 | ≈1.5× |
+| 16 | 44  | 2 | 63  | 3 | ≈1.4× |
+| 32 | 91  | 2 | 136 | 4 | ≈1.5× |
+
+Realized gain is ≈1.4–1.5×, below the naive 2× decision-count ratio,
+because species-2 decisions include the zero-bit boundary singletons and
+passing-tone beats with arity below the species-1 average. (Framing
+overhead also differs: v0.3 adds one species byte, so
+`V3_MIN_REGION = MIN_REGION + 1 = 44`.)
 
 ## Prior art anchoring
 
