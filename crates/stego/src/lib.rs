@@ -34,6 +34,15 @@
 //! ever needed on the decoder side. Species 1 is permanent: no deprecation,
 //! no default swap; species 2 is strictly opt-in per embed.
 //!
+//! Framing versions: species-1 embeds keep the v0.2 layout
+//! (`[0x01][IV][nonce][len][body][MAC][0x01]`) so every v0.2 cover stays
+//! readable. Species-2 embeds use the v0.3 layout
+//! `[0x03][IV][nonce][species u8][len][body][MAC][0x03]` with a
+//! version-separated IV domain — a v0.3 frame can never pass the v0.2
+//! boundary check under the same key, and the declared species is
+//! cross-checked against the cover's voice geometry before the MAC. The M9
+//! ECC region (`[0x02][region x3]`) remains v0.2 species-1 format.
+//!
 //! M9 error correction (active-warden case): `embed_with_ecc` wraps the
 //! region as `[0x02][region x3]` — extraction majority-votes the three
 //! copies, so any single-byte corruption of the payload integer is
@@ -134,10 +143,17 @@ pub const NONCE_BYTES: usize = 8;
 pub const LEN_BYTES: usize = 1;
 pub const TAG_BYTES: usize = 16;
 pub const TRAILER: u8 = 0x01;
+/// v0.3 framing: sentinel/trailer for frames that carry a species byte.
+pub const SENTINEL_V3: u8 = 0x03;
+pub const TRAILER_V3: u8 = 0x03;
+/// v0.3 frames insert a species byte between the nonce and the length.
+pub const SPECIES_BYTES: usize = 1;
 /// sentinel + IV: everything before the nonce.
 pub const HEADER_BYTES: usize = 1 + IV_BYTES;
 /// smallest possible region: header + nonce + len + tag + trailer.
 pub const MIN_REGION: usize = HEADER_BYTES + NONCE_BYTES + LEN_BYTES + TAG_BYTES + 1;
+/// smallest possible v0.3 region: the v0.2 minimum plus the species byte.
+pub const V3_MIN_REGION: usize = MIN_REGION + SPECIES_BYTES;
 
 /// Counterpoint species: the rule set the CP voice follows. `First` is the
 /// v0.2 behavior (whole-note counterpoint, v0.2 framing). `Second` steers
@@ -203,6 +219,26 @@ pub fn framing_bits(msg_len: usize) -> usize {
     (HEADER_BYTES + NONCE_BYTES + LEN_BYTES + TAG_BYTES + msg_len + 1) * 8
 }
 
+/// v0.3 region size in bits: the v0.2 layout plus the species byte.
+pub fn framing_bits_v3(msg_len: usize) -> usize {
+    (HEADER_BYTES + NONCE_BYTES + SPECIES_BYTES + LEN_BYTES + TAG_BYTES + msg_len + 1) * 8
+}
+
+fn species_byte(s: Species) -> u8 {
+    match s {
+        Species::First => 0x01,
+        Species::Second => 0x02,
+    }
+}
+
+fn species_from_byte(b: u8) -> Result<Species, StegoError> {
+    match b {
+        0x01 => Ok(Species::First),
+        0x02 => Ok(Species::Second),
+        _ => Err(StegoError::WrongKey),
+    }
+}
+
 /// Build the framed payload region:
 /// `[0x01][iv 16][nonce le64][len u8][keystream-XOR body][tag 16][0x01]`.
 fn build_framed(message: &[u8], key: &[u8; 32], nonce: u64) -> Vec<u8> {
@@ -219,6 +255,30 @@ fn build_framed(message: &[u8], key: &[u8; 32], nonce: u64) -> Vec<u8> {
     framed.extend_from_slice(&body);
     framed.extend_from_slice(&tag);
     framed.push(TRAILER);
+    framed
+}
+
+/// v0.3 framed region:
+/// `[0x03][iv 16][nonce le64][species u8][len u8][body][tag 16][0x03]`.
+/// The species byte makes the framing declare which replay the cover must
+/// satisfy; `extract_with_key` cross-checks it against voice geometry. The
+/// IV uses a v3-specific domain so a v0.3 frame can never pass the v0.2
+/// boundary check under the same key (and vice versa) — no downgrade path.
+fn build_framed_v3(message: &[u8], key: &[u8; 32], nonce: u64, species: Species) -> Vec<u8> {
+    let mut body = message.to_vec();
+    keys::apply_keystream_with_key(&mut body, key);
+    let tag = keys::mac_tag_from_key(key, &body);
+    let iv = keys::sha256(&[b"countersteg-ac-iv-v3", key]);
+
+    let mut framed = Vec::with_capacity(V3_MIN_REGION + message.len());
+    framed.push(SENTINEL_V3);
+    framed.extend_from_slice(&iv[..IV_BYTES]);
+    framed.extend_from_slice(&nonce.to_le_bytes());
+    framed.push(species_byte(species));
+    framed.push(message.len() as u8);
+    framed.extend_from_slice(&body);
+    framed.extend_from_slice(&tag);
+    framed.push(TRAILER_V3);
     framed
 }
 
@@ -273,14 +333,38 @@ fn rebuild(decisions: &[Decision]) -> Vec<u8> {
     enc.finish().to_be_bytes()
 }
 
-/// Parse `[sentinel][IV][nonce][len]` out of a rebuilt region and return
-/// `(nonce, claimed_len)`. Marker and bounds failures are indistinguishable
-/// from a wrong key.
-fn parse_region(bytes: &[u8]) -> Result<(u64, usize), StegoError> {
-    if bytes.first() != Some(&SENTINEL) || bytes.last() != Some(&TRAILER) {
-        return Err(StegoError::WrongKey);
-    }
-    if bytes.len() < MIN_REGION {
+/// Framing version, read off the sentinel/trailer pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    V2,
+    V3,
+}
+
+/// Parsed region header: everything `extract_with_key` needs after the
+/// layout check, before the MAC.
+struct Region {
+    framing: Framing,
+    nonce: u64,
+    claimed: usize,
+    species: Species,
+    body_start: usize,
+}
+
+/// Parse the region header out of a rebuilt payload and return the framing
+/// version, nonce, claimed length, declared species, and body offset.
+/// Marker, layout, and bounds failures are indistinguishable from a wrong
+/// key.
+fn parse_region(bytes: &[u8]) -> Result<Region, StegoError> {
+    let framing = match (bytes.first(), bytes.last()) {
+        (Some(&SENTINEL), Some(&TRAILER)) => Framing::V2,
+        (Some(&SENTINEL_V3), Some(&TRAILER_V3)) => Framing::V3,
+        _ => return Err(StegoError::WrongKey),
+    };
+    let min_region = match framing {
+        Framing::V2 => MIN_REGION,
+        Framing::V3 => V3_MIN_REGION,
+    };
+    if bytes.len() < min_region {
         return Err(StegoError::Decode("region too short".into()));
     }
     let nonce = u64::from_le_bytes(
@@ -288,11 +372,24 @@ fn parse_region(bytes: &[u8]) -> Result<(u64, usize), StegoError> {
             .try_into()
             .unwrap(),
     );
-    let claimed = bytes[HEADER_BYTES + NONCE_BYTES] as usize;
-    if bytes.len() < MIN_REGION + claimed {
+    let (species, len_pos) = match framing {
+        Framing::V2 => (Species::First, HEADER_BYTES + NONCE_BYTES),
+        Framing::V3 => {
+            let s = species_from_byte(bytes[HEADER_BYTES + NONCE_BYTES])?;
+            (s, HEADER_BYTES + NONCE_BYTES + SPECIES_BYTES)
+        }
+    };
+    let claimed = bytes[len_pos] as usize;
+    if bytes.len() < min_region + claimed {
         return Err(StegoError::WrongKey);
     }
-    Ok((nonce, claimed))
+    Ok(Region {
+        framing,
+        nonce,
+        claimed,
+        species,
+        body_start: len_pos + LEN_BYTES,
+    })
 }
 
 /// Payload capacity estimate (bits) for a score of `len` whole notes.
@@ -414,16 +511,18 @@ pub fn embed_species(
         return Err(StegoError::Decode("message exceeds 255 bytes".into()));
     }
     let key = keys::derive_key(passphrase, nonce);
-    let framed = build_framed(message, &key, nonce);
+    // Framing per species: First keeps the v0.2 layout (species-1 covers
+    // remain readable by v0.2 decoders); Second uses the v0.3 frame with its
+    // declared species byte.
+    let (framed, needed) = match species {
+        Species::First => (build_framed(message, &key, nonce), framing_bits(message.len())),
+        Species::Second => (
+            build_framed_v3(message, &key, nonce, species),
+            framing_bits_v3(message.len()),
+        ),
+    };
     let payload = BigUint::from_be_bytes(&framed);
-    embed_loop(
-        &payload,
-        &key,
-        message,
-        framing_bits(message.len()),
-        min_len,
-        species,
-    )
+    embed_loop(&payload, &key, message, needed, min_len, species)
 }
 
 /// M9: like `embed`, but the region is triplicated so that extraction
@@ -456,18 +555,31 @@ pub fn embed_with_ecc(
 pub fn extract_with_key(cf: &[Note], cp: &[Note], key: &[u8; 32]) -> Result<Vec<u8>, StegoError> {
     let decisions = decisions_for(cf, cp).map_err(StegoError::Decode)?;
     let bytes = unwrap_ec(&rebuild(&decisions))?;
-    let (_nonce, claimed) = parse_region(&bytes)?;
+    let region = parse_region(&bytes)?;
 
-    // The key-derived IV authenticates the framing boundary: anything but
-    // the exact key fails here before `claimed` is ever used as a length.
-    let iv = keys::sha256(&[b"countersteg-ac-iv", key]);
+    // Cross-check: the framing-declared species must agree with the cover's
+    // voice geometry (the replay above already pinned it). The MAC would
+    // catch a flip downstream too, but a disagreement here is tampering —
+    // fail closed, indistinguishable from a wrong key.
+    if detect_species(cf, cp) != Some(region.species) {
+        return Err(StegoError::WrongKey);
+    }
+
+    // The key-derived IV authenticates the framing boundary with the
+    // version-specific domain: anything but the exact key fails here before
+    // `claimed` is ever used as a length.
+    let iv_domain: &[u8] = match region.framing {
+        Framing::V2 => b"countersteg-ac-iv",
+        Framing::V3 => b"countersteg-ac-iv-v3",
+    };
+    let iv = keys::sha256(&[iv_domain, key]);
     if bytes[1..HEADER_BYTES] != iv[..IV_BYTES] {
         return Err(StegoError::WrongKey);
     }
 
-    let body_start = HEADER_BYTES + NONCE_BYTES + LEN_BYTES;
-    let mut body = bytes[body_start..body_start + claimed].to_vec();
-    let tag: [u8; TAG_BYTES] = bytes[body_start + claimed..body_start + claimed + TAG_BYTES]
+    let body_start = region.body_start;
+    let mut body = bytes[body_start..body_start + region.claimed].to_vec();
+    let tag: [u8; TAG_BYTES] = bytes[body_start + region.claimed..body_start + region.claimed + TAG_BYTES]
         .try_into()
         .unwrap();
     if keys::mac_tag_from_key(key, &body) != tag {
@@ -482,8 +594,8 @@ pub fn extract_with_key(cf: &[Note], cp: &[Note], key: &[u8; 32]) -> Result<Vec<
 pub fn extract(cf: &[Note], cp: &[Note], passphrase: &str) -> Result<Vec<u8>, StegoError> {
     let decisions = decisions_for(cf, cp).map_err(StegoError::Decode)?;
     let bytes = unwrap_ec(&rebuild(&decisions))?;
-    let (nonce, _claimed) = parse_region(&bytes)?;
-    let key = keys::derive_key(passphrase, nonce);
+    let region = parse_region(&bytes)?;
+    let key = keys::derive_key(passphrase, region.nonce);
     extract_with_key(cf, cp, &key)
 }
 
@@ -639,6 +751,96 @@ mod tests {
         assert_eq!(ec.len(), 1 + 3 * (MIN_REGION + 6));
         assert_eq!(&ec[..1], &[EC_SENTINEL]);
         assert_eq!(&ec[1..1 + 49], &build_framed(b"vector", &key, 0x0102030405060708)[..]);
+    }
+
+    /// v0.3 known-answer vectors, same construction as
+    /// `framed_region_known_answers`: pins the v3 sentinel, the
+    /// version-separated IV domain, the species byte, and the trailer.
+    /// Captured from real runs; a regression anywhere in that chain changes
+    /// these bytes and fails here.
+    #[test]
+    fn framed_v3_known_answers() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let key = keys::derive_key("integrity vector", 0x0102030405060708);
+        assert_eq!(
+            hex(&build_framed_v3(b"vector", &key, 0x0102030405060708, Species::Second)),
+            "037b2f517f52709d0184c95fe91daf3171\
+             0807060504030201020603\
+             894c3e7cd6d700212dd83416ea9317d82c2dac3d4803"
+        );
+        // Minimal region with the species-1 byte: still v3 framing.
+        assert_eq!(
+            hex(&build_framed_v3(b"", &key, 0, Species::First)),
+            "037b2f517f52709d0184c95fe91daf3171\
+             00000000000000000100\
+             a63e590505b2189223962b7db9f705fc03"
+        );
+    }
+
+    #[test]
+    fn framed_v3_layout_and_stable_ends() {
+        let key = keys::derive_key("pw", 42);
+        let framed = build_framed_v3(b"hi", &key, 42, Species::Second);
+        assert_eq!(framed[0], SENTINEL_V3);
+        assert_eq!(framed[framed.len() - 1], TRAILER_V3);
+        assert_eq!(framed.len(), V3_MIN_REGION + 2);
+        assert_eq!(framed[HEADER_BYTES + NONCE_BYTES], 0x02); // species byte
+        let x = BigUint::from_be_bytes(&framed);
+        assert_eq!(x.to_be_bytes(), framed);
+    }
+
+    #[test]
+    fn v3_rejects_bad_species_byte() {
+        let key = keys::derive_key("pw", 9);
+        let mut framed = build_framed_v3(b"hi", &key, 9, Species::Second);
+        framed[HEADER_BYTES + NONCE_BYTES] = 0x07;
+        assert!(matches!(parse_region(&framed), Err(StegoError::WrongKey)));
+    }
+
+    #[test]
+    fn v2_and_v3_parse_under_their_own_layout() {
+        let key = keys::derive_key("pw", 9);
+        let v2 = build_framed(b"hi", &key, 9);
+        let r2 = parse_region(&v2).unwrap();
+        assert_eq!(r2.framing, Framing::V2);
+        assert_eq!(r2.species, Species::First);
+        // A v3 frame declaring species 1 parses too — the parser accepts
+        // any declared species; embed never produces this combination.
+        let v3 = build_framed_v3(b"hi", &key, 9, Species::First);
+        let r3 = parse_region(&v3).unwrap();
+        assert_eq!(r3.framing, Framing::V3);
+        assert_eq!(r3.species, Species::First);
+    }
+
+    #[test]
+    fn v3_species_geometry_crosscheck_rejects_mismatch() {
+        // A v3 frame declaring species 2 steered into a species-1 cover must
+        // fail closed at the geometry cross-check, not decode garbage.
+        let key = keys::derive_key("pw", 5);
+        let framed = build_framed_v3(b"hi", &key, 5, Species::Second);
+        let payload = BigUint::from_be_bytes(&framed);
+        let mut chooser = AcChooser {
+            dec: ac::RadixDecoder::new(payload),
+        };
+        let comp = compose_with(16, &mut chooser);
+        let res = extract_with_key(&comp.cf, &comp.cp, &key);
+        assert!(matches!(res, Err(StegoError::WrongKey)));
+    }
+
+    #[test]
+    fn species2_embed_uses_v3_framing() {
+        let msg = b"framing probe";
+        let (comp, _) = embed_species(msg, "pw", 7, 16, Species::Second).unwrap();
+        let (cf, cp) = match &comp {
+            Embedded::Second(c) => (&c.cf, &c.cp),
+            Embedded::First(_) => panic!("expected second species"),
+        };
+        let ds = decisions_for(cf, cp).unwrap();
+        let bytes = unwrap_ec(&rebuild(&ds)).unwrap();
+        let region = parse_region(&bytes).unwrap();
+        assert_eq!(region.framing, Framing::V3);
+        assert_eq!(region.species, Species::Second);
+        assert_eq!(extract(cf, cp, "pw").unwrap(), msg);
     }
 
     #[test]
