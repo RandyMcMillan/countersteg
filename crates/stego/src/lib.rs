@@ -1006,6 +1006,47 @@ mod tests {
         }
     }
 
+    /// M8, species 2: the same warden test against the second-species
+    /// generator — embed via v0.3 framing across 24 fixed nonces and compare
+    /// the per-arity choice distribution against the natural `compose2`
+    /// baseline. The species-1 assertions above are unchanged; species 2
+    /// gets its own bound because its arity histogram shifts (boundary
+    /// upbeats are forced arity-1, zero-bit decisions) even under a perfect
+    /// encoder.
+    #[test]
+    fn self_steganalysis_distribution_matches_natural_species2() {
+        let msg = b"distribution probe";
+        let len = 64;
+        let mut embedded: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut natural: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for seed in 0..24u64 {
+            let (comp, _) =
+                embed_species(msg, "pw", 1_000 + seed, len, Species::Second).unwrap();
+            let Embedded::Second(comp) = comp else {
+                panic!("species-2 embed must yield Embedded::Second");
+            };
+            let ds = decisions_of2(&comp.cf, &comp.cp).unwrap();
+            for (arity, counts) in tally(&ds) {
+                let v = embedded.entry(arity).or_insert_with(|| vec![0; arity as usize]);
+                for (i, c) in counts.iter().enumerate() {
+                    v[i] += c;
+                }
+            }
+            let nat = engine::species::second::compose2(seed, len);
+            for (arity, counts) in tally(&nat.decisions) {
+                let v = natural.entry(arity).or_insert_with(|| vec![0; arity as usize]);
+                for (i, c) in counts.iter().enumerate() {
+                    v[i] += c;
+                }
+            }
+        }
+        let tv = total_variation(&embedded, &natural);
+        assert!(!tv.is_empty(), "no overlapping arity buckets");
+        for (arity, d) in tv {
+            assert!(d < 0.20, "species-2 arity {arity}: total variation {d:.3} vs natural");
+        }
+    }
+
     /// M7: steered decisions must use the FULL candidate range at every
     /// arity, not just `2^n` of it (the v2 chunk-chooser bias).
     #[test]
