@@ -16,14 +16,40 @@ fn note_name(midi: u8) -> String {
 }
 
 fn print_score(cf: &[engine::Note], cp: &[engine::Note]) {
-    println!("{:>4} {:>6} {:>6}", "pos", "cf", "cp");
-    for i in 0..cf.len() {
-        println!(
-            "{:>4} {:>6} {:>6}",
-            i,
-            note_name(cf[i].midi()),
-            note_name(cp[i].midi())
-        );
+    if cp.len() == 2 * cf.len() {
+        // Second species: two CP beats per position.
+        println!("{:>4} {:>6} {:>8} {:>6}", "pos", "cf", "cp-down", "cp-up");
+        for i in 0..cf.len() {
+            println!(
+                "{:>4} {:>6} {:>8} {:>6}",
+                i,
+                note_name(cf[i].midi()),
+                note_name(cp[2 * i].midi()),
+                note_name(cp[2 * i + 1].midi())
+            );
+        }
+    } else {
+        println!("{:>4} {:>6} {:>6}", "pos", "cf", "cp");
+        for i in 0..cf.len() {
+            println!(
+                "{:>4} {:>6} {:>6}",
+                i,
+                note_name(cf[i].midi()),
+                note_name(cp[i].midi())
+            );
+        }
+    }
+}
+
+fn parse_species(args: &[String]) -> Option<stego::Species> {
+    match opt(args, "--species") {
+        None => Some(stego::Species::First), // no default swap, ever
+        Some("1") => Some(stego::Species::First),
+        Some("2") => Some(stego::Species::Second),
+        Some(other) => {
+            eprintln!("--species must be 1 or 2, got {other:?}");
+            None
+        }
     }
 }
 
@@ -122,14 +148,29 @@ fn cmd_embed(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match stego::embed(message.as_bytes(), key, seed, min_len) {
+    let species = match parse_species(args) {
+        Some(s) => s,
+        None => return ExitCode::from(2),
+    };
+    match stego::embed_species(message.as_bytes(), key, seed, min_len, species) {
         Ok((comp, len)) => {
-            print_score(&comp.cf, &comp.cp);
+            let (cf, cp) = match &comp {
+                stego::Embedded::First(c) => (&c.cf, &c.cp),
+                stego::Embedded::Second(c) => (&c.cf, &c.cp),
+            };
+            print_score(cf, cp);
             // No track name: embedded files carry no identifying metadata.
-            let bytes = engine::write_smf_named(&comp, None);
+            let bytes = match &comp {
+                stego::Embedded::First(c) => engine::write_smf_named(c, None),
+                stego::Embedded::Second(c) => engine::write_smf2_named(c, None),
+            };
             std::fs::write(out, bytes).expect("write midi");
+            let species_name = match species {
+                stego::Species::First => "species-1",
+                stego::Species::Second => "species-2",
+            };
             println!(
-                "embedded {} bytes ({} bits payload + framing) into {} notes -> {out} (nonce {})",
+                "embedded {} bytes ({} bits payload + framing) into {} notes ({species_name}) -> {out} (nonce {})",
                 message.len(),
                 message.len() * 8,
                 len,
@@ -161,9 +202,15 @@ fn cmd_extract(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let cf: Vec<engine::Note> = data.cf.iter().map(|&m| engine::Note::from_midi(m).unwrap()).collect();
-    let cp: Vec<engine::Note> = data.cp.iter().map(|&m| engine::Note::from_midi(m).unwrap()).collect();
-    // Framing v2: the nonce is read from the bitstream; only the key is needed.
+    let (cf, cp) = match data.to_notes() {
+        Some(v) => v,
+        None => {
+            eprintln!("MIDI data is not a countersteg cover (voice geometry or pitch set)");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Species auto-detected from voice geometry; the nonce is read from the
+    // bitstream; only the key is needed.
     match stego::extract(&cf, &cp, key) {
         Ok(msg) => {
             println!("{}", String::from_utf8_lossy(&msg));
@@ -189,14 +236,22 @@ fn cmd_stats(args: &[String]) -> ExitCode {
     println!("cf notes: {}  cp notes: {}", data.cf.len(), data.cp.len());
     println!("cf entropy: {:.3} bits/byte", entropy::shannon_entropy(&data.cf));
     println!("cp entropy: {:.3} bits/byte", entropy::shannon_entropy(&data.cp));
-    let cf: Vec<engine::Note> = data.cf.iter().map(|&m| engine::Note::from_midi(m).unwrap()).collect();
-    let cp: Vec<engine::Note> = data.cp.iter().map(|&m| engine::Note::from_midi(m).unwrap()).collect();
-    match engine::decisions_of(&cf, &cp) {
-        Ok(ds) => {
-            let cap = engine::capacity_bits(&ds);
-            println!("decisions: {}  channel capacity: {cap} bits (~{} bytes)", ds.len(), cap / 8);
-        }
-        Err(e) => println!("decision replay: {e}"),
+    let len = data.cf.len();
+    println!(
+        "capacity estimate at {len} bars: species-1 ~{} bits, species-2 ~{} bits",
+        stego::available_bits_species(0, len, stego::Species::First),
+        stego::available_bits_species(0, len, stego::Species::Second),
+    );
+    match data.to_notes() {
+        Some((cf, cp)) => match stego::replay_decisions(&cf, &cp) {
+            Ok(ds) => {
+                let species = if cp.len() == 2 * cf.len() { "species-2" } else { "species-1" };
+                let cap = engine::capacity_bits(&ds);
+                println!("{species}: decisions: {}  channel capacity: {cap} bits (~{} bytes)", ds.len(), cap / 8);
+            }
+            Err(e) => println!("decision replay: {e}"),
+        },
+        None => println!("voice geometry fits neither species"),
     }
     if let Some(name) = data.track_name {
         println!("track name: {name}");

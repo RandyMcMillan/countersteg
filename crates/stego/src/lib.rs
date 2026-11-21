@@ -25,6 +25,24 @@
 //! The key-derived IV authenticates the framing boundary before the claimed
 //! length is trusted: a wrong key fails here, not on a length check.
 //!
+//! Species dispatch: `embed` steers first-species whole-note counterpoint
+//! (v0.2 behavior, unchanged). `embed_species(.., Species::Second)` steers
+//! second-species half-note counterpoint instead — two selection-channel
+//! decisions per position, roughly 1.5x the capacity at the same bar count.
+//! Extraction auto-detects the species from voice geometry
+//! (`cp.len() == cf.len()` vs `2 * cf.len()`), so no species argument is
+//! ever needed on the decoder side. Species 1 is permanent: no deprecation,
+//! no default swap; species 2 is strictly opt-in per embed.
+//!
+//! Framing versions: species-1 embeds keep the v0.2 layout
+//! (`[0x01][IV][nonce][len][body][MAC][0x01]`) so every v0.2 cover stays
+//! readable. Species-2 embeds use the v0.3 layout
+//! `[0x03][IV][nonce][species u8][len][body][MAC][0x03]` with a
+//! version-separated IV domain — a v0.3 frame can never pass the v0.2
+//! boundary check under the same key, and the declared species is
+//! cross-checked against the cover's voice geometry before the MAC. The M9
+//! ECC region (`[0x02][region x3]`) remains v0.2 species-1 format.
+//!
 //! M9 error correction (active-warden case): `embed_with_ecc` wraps the
 //! region as `[0x02][region x3]` — extraction majority-votes the three
 //! copies, so any single-byte corruption of the payload integer is
@@ -69,6 +87,7 @@
 //! corruption is repaired while multi-byte corruption still fails closed
 //! at the MAC rather than decoding garbage.
 
+use engine::species::second::{compose_with2, decisions_of2, Composition2};
 use engine::{compose_with, decisions_of, Chooser, Composition, Decision, Note};
 
 mod ac;
@@ -124,10 +143,70 @@ pub const NONCE_BYTES: usize = 8;
 pub const LEN_BYTES: usize = 1;
 pub const TAG_BYTES: usize = 16;
 pub const TRAILER: u8 = 0x01;
+/// v0.3 framing: sentinel/trailer for frames that carry a species byte.
+pub const SENTINEL_V3: u8 = 0x03;
+pub const TRAILER_V3: u8 = 0x03;
+/// v0.3 frames insert a species byte between the nonce and the length.
+pub const SPECIES_BYTES: usize = 1;
 /// sentinel + IV: everything before the nonce.
 pub const HEADER_BYTES: usize = 1 + IV_BYTES;
 /// smallest possible region: header + nonce + len + tag + trailer.
 pub const MIN_REGION: usize = HEADER_BYTES + NONCE_BYTES + LEN_BYTES + TAG_BYTES + 1;
+/// smallest possible v0.3 region: the v0.2 minimum plus the species byte.
+pub const V3_MIN_REGION: usize = MIN_REGION + SPECIES_BYTES;
+
+/// Counterpoint species: the rule set the CP voice follows. `First` is the
+/// v0.2 behavior (whole-note counterpoint, v0.2 framing). `Second` steers
+/// the two half notes per position and (see `embed_species`) uses the v0.3
+/// framing. Extraction never takes a species argument: the voice geometry
+/// (`cp.len()` vs `cf.len()`) disambiguates, and the v0.3 framing carries a
+/// species byte cross-checked against that geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Species {
+    First,
+    Second,
+}
+
+/// The steered composition returned by `embed_species`. Callers persist it
+/// with `write_smf_named` / `write_smf2_named` (no identifying metadata).
+#[derive(Debug)]
+pub enum Embedded {
+    First(Composition),
+    Second(Composition2),
+}
+
+/// Species implied by voice geometry: `cp.len() == cf.len()` -> first,
+/// `cp.len() == 2 * cf.len()` -> second. Any other ratio is not a
+/// countersteg cover (or is corrupt).
+fn detect_species(cf: &[Note], cp: &[Note]) -> Option<Species> {
+    if cp.len() == cf.len() {
+        Some(Species::First)
+    } else if cp.len() == 2 * cf.len() {
+        Some(Species::Second)
+    } else {
+        None
+    }
+}
+
+/// Replay decisions under the species the voice geometry implies.
+fn decisions_for(cf: &[Note], cp: &[Note]) -> Result<Vec<Decision>, String> {
+    match detect_species(cf, cp) {
+        Some(Species::First) => decisions_of(cf, cp),
+        Some(Species::Second) => decisions_of2(cf, cp),
+        None => Err(format!(
+            "cp/cf length ratio {}:{} is not a known species",
+            cp.len(),
+            cf.len()
+        )),
+    }
+}
+
+/// Replay the decisions of a cover, auto-detecting the species from voice
+/// geometry. Public for stats/introspection tools; `extract` uses the same
+/// path.
+pub fn replay_decisions(cf: &[Note], cp: &[Note]) -> Result<Vec<Decision>, String> {
+    decisions_for(cf, cp)
+}
 
 /// M9: marks a triplicated region `[0x02][region x3]`; decode majority-votes.
 pub const EC_SENTINEL: u8 = 0x02;
@@ -138,6 +217,26 @@ pub const EC_MAX_MESSAGE: usize = 64;
 /// Region size in bits for a message of `msg_len` bytes.
 pub fn framing_bits(msg_len: usize) -> usize {
     (HEADER_BYTES + NONCE_BYTES + LEN_BYTES + TAG_BYTES + msg_len + 1) * 8
+}
+
+/// v0.3 region size in bits: the v0.2 layout plus the species byte.
+pub fn framing_bits_v3(msg_len: usize) -> usize {
+    (HEADER_BYTES + NONCE_BYTES + SPECIES_BYTES + LEN_BYTES + TAG_BYTES + msg_len + 1) * 8
+}
+
+fn species_byte(s: Species) -> u8 {
+    match s {
+        Species::First => 0x01,
+        Species::Second => 0x02,
+    }
+}
+
+fn species_from_byte(b: u8) -> Result<Species, StegoError> {
+    match b {
+        0x01 => Ok(Species::First),
+        0x02 => Ok(Species::Second),
+        _ => Err(StegoError::WrongKey),
+    }
 }
 
 /// Build the framed payload region:
@@ -156,6 +255,30 @@ fn build_framed(message: &[u8], key: &[u8; 32], nonce: u64) -> Vec<u8> {
     framed.extend_from_slice(&body);
     framed.extend_from_slice(&tag);
     framed.push(TRAILER);
+    framed
+}
+
+/// v0.3 framed region:
+/// `[0x03][iv 16][nonce le64][species u8][len u8][body][tag 16][0x03]`.
+/// The species byte makes the framing declare which replay the cover must
+/// satisfy; `extract_with_key` cross-checks it against voice geometry. The
+/// IV uses a v3-specific domain so a v0.3 frame can never pass the v0.2
+/// boundary check under the same key (and vice versa) — no downgrade path.
+fn build_framed_v3(message: &[u8], key: &[u8; 32], nonce: u64, species: Species) -> Vec<u8> {
+    let mut body = message.to_vec();
+    keys::apply_keystream_with_key(&mut body, key);
+    let tag = keys::mac_tag_from_key(key, &body);
+    let iv = keys::sha256(&[b"countersteg-ac-iv-v3", key]);
+
+    let mut framed = Vec::with_capacity(V3_MIN_REGION + message.len());
+    framed.push(SENTINEL_V3);
+    framed.extend_from_slice(&iv[..IV_BYTES]);
+    framed.extend_from_slice(&nonce.to_le_bytes());
+    framed.push(species_byte(species));
+    framed.push(message.len() as u8);
+    framed.extend_from_slice(&body);
+    framed.extend_from_slice(&tag);
+    framed.push(TRAILER_V3);
     framed
 }
 
@@ -210,14 +333,38 @@ fn rebuild(decisions: &[Decision]) -> Vec<u8> {
     enc.finish().to_be_bytes()
 }
 
-/// Parse `[sentinel][IV][nonce][len]` out of a rebuilt region and return
-/// `(nonce, claimed_len)`. Marker and bounds failures are indistinguishable
-/// from a wrong key.
-fn parse_region(bytes: &[u8]) -> Result<(u64, usize), StegoError> {
-    if bytes.first() != Some(&SENTINEL) || bytes.last() != Some(&TRAILER) {
-        return Err(StegoError::WrongKey);
-    }
-    if bytes.len() < MIN_REGION {
+/// Framing version, read off the sentinel/trailer pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    V2,
+    V3,
+}
+
+/// Parsed region header: everything `extract_with_key` needs after the
+/// layout check, before the MAC.
+struct Region {
+    framing: Framing,
+    nonce: u64,
+    claimed: usize,
+    species: Species,
+    body_start: usize,
+}
+
+/// Parse the region header out of a rebuilt payload and return the framing
+/// version, nonce, claimed length, declared species, and body offset.
+/// Marker, layout, and bounds failures are indistinguishable from a wrong
+/// key.
+fn parse_region(bytes: &[u8]) -> Result<Region, StegoError> {
+    let framing = match (bytes.first(), bytes.last()) {
+        (Some(&SENTINEL), Some(&TRAILER)) => Framing::V2,
+        (Some(&SENTINEL_V3), Some(&TRAILER_V3)) => Framing::V3,
+        _ => return Err(StegoError::WrongKey),
+    };
+    let min_region = match framing {
+        Framing::V2 => MIN_REGION,
+        Framing::V3 => V3_MIN_REGION,
+    };
+    if bytes.len() < min_region {
         return Err(StegoError::Decode("region too short".into()));
     }
     let nonce = u64::from_le_bytes(
@@ -225,19 +372,96 @@ fn parse_region(bytes: &[u8]) -> Result<(u64, usize), StegoError> {
             .try_into()
             .unwrap(),
     );
-    let claimed = bytes[HEADER_BYTES + NONCE_BYTES] as usize;
-    if bytes.len() < MIN_REGION + claimed {
+    let (species, len_pos) = match framing {
+        Framing::V2 => (Species::First, HEADER_BYTES + NONCE_BYTES),
+        Framing::V3 => {
+            let s = species_from_byte(bytes[HEADER_BYTES + NONCE_BYTES])?;
+            (s, HEADER_BYTES + NONCE_BYTES + SPECIES_BYTES)
+        }
+    };
+    let claimed = bytes[len_pos] as usize;
+    if bytes.len() < min_region + claimed {
         return Err(StegoError::WrongKey);
     }
-    Ok((nonce, claimed))
+    Ok(Region {
+        framing,
+        nonce,
+        claimed,
+        species,
+        body_start: len_pos + LEN_BYTES,
+    })
 }
 
 /// Payload capacity estimate (bits) for a score of `len` whole notes.
 /// The exact capacity depends on the path taken; treat this as a
 /// lower-bound hint (see `embed`, which verifies the real figure).
 pub fn available_bits(nonce: u64, len: usize) -> usize {
-    let comp = engine::compose(nonce, len);
-    path_bits(&comp.decisions)
+    available_bits_species(nonce, len, Species::First)
+}
+
+/// Like `available_bits`, for either species. Second species carries the
+/// two CP beats per position as separate decisions, so its channel is
+/// roughly 1.5x wider at the same bar count.
+pub fn available_bits_species(nonce: u64, len: usize, species: Species) -> usize {
+    match species {
+        Species::First => path_bits(&engine::compose(nonce, len).decisions),
+        Species::Second => path_bits(&engine::species::second::compose2(nonce, len).decisions),
+    }
+}
+
+/// Extend the score from `min_len` until the steered path covers `needed`
+/// bits *and* a full in-process extraction reproduces the message (the
+/// self-check is authoritative — capacity arithmetic alone is only a hint).
+/// Fails with precise capacity after 128 extensions.
+fn embed_loop(
+    payload: &BigUint,
+    key: &[u8; 32],
+    message: &[u8],
+    needed: usize,
+    min_len: usize,
+    species: Species,
+) -> Result<(Embedded, usize), StegoError> {
+    let mut last_capacity = 0usize;
+    for ext in 0..128 {
+        let len = min_len + ext * 8;
+        let mut chooser = AcChooser {
+            dec: ac::RadixDecoder::new(payload.clone()),
+        };
+        match species {
+            Species::First => {
+                let comp = compose_with(len, &mut chooser);
+                last_capacity = decisions_of(&comp.cf, &comp.cp)
+                    .map(|ds| path_bits(&ds))
+                    .unwrap_or(0);
+                if last_capacity >= needed
+                    && matches!(
+                        extract_with_key(&comp.cf, &comp.cp, key).as_deref(),
+                        Ok(out) if out == message
+                    )
+                {
+                    return Ok((Embedded::First(comp), len));
+                }
+            }
+            Species::Second => {
+                let comp = compose_with2(len, &mut chooser);
+                last_capacity = decisions_of2(&comp.cf, &comp.cp)
+                    .map(|ds| path_bits(&ds))
+                    .unwrap_or(0);
+                if last_capacity >= needed
+                    && matches!(
+                        extract_with_key(&comp.cf, &comp.cp, key).as_deref(),
+                        Ok(out) if out == message
+                    )
+                {
+                    return Ok((Embedded::Second(comp), len));
+                }
+            }
+        }
+    }
+    Err(StegoError::CapacityExceeded {
+        needed_bits: needed,
+        capacity_bits: last_capacity,
+    })
 }
 
 /// Embed a message into a fresh composition. Starts at `min_len` whole-note
@@ -258,90 +482,104 @@ pub fn embed(
     nonce: u64,
     min_len: usize,
 ) -> Result<(Composition, usize), StegoError> {
-    embed_inner(message, passphrase, nonce, min_len, false)
+    if message.len() > 255 {
+        return Err(StegoError::Decode("message exceeds 255 bytes".into()));
+    }
+    // Derive once: stretching is ~100k SHA-256 rounds and the loop below
+    // may try many score lengths.
+    let key = keys::derive_key(passphrase, nonce);
+    let framed = build_framed(message, &key, nonce);
+    let payload = BigUint::from_be_bytes(&framed);
+    match embed_loop(&payload, &key, message, framing_bits(message.len()), min_len, Species::First)? {
+        (Embedded::First(comp), len) => Ok((comp, len)),
+        _ => unreachable!("embed is species-1 only"),
+    }
+}
+
+/// Second-species embed: like `embed`, but the CP voice carries two half
+/// notes per position (see `engine::species::second`), roughly 1.5x the
+/// channel capacity at the same bar count. Persist with
+/// `write_smf2_named(.., None)`.
+pub fn embed_species(
+    message: &[u8],
+    passphrase: &str,
+    nonce: u64,
+    min_len: usize,
+    species: Species,
+) -> Result<(Embedded, usize), StegoError> {
+    if message.len() > 255 {
+        return Err(StegoError::Decode("message exceeds 255 bytes".into()));
+    }
+    let key = keys::derive_key(passphrase, nonce);
+    // Framing per species: First keeps the v0.2 layout (species-1 covers
+    // remain readable by v0.2 decoders); Second uses the v0.3 frame with its
+    // declared species byte.
+    let (framed, needed) = match species {
+        Species::First => (build_framed(message, &key, nonce), framing_bits(message.len())),
+        Species::Second => (
+            build_framed_v3(message, &key, nonce, species),
+            framing_bits_v3(message.len()),
+        ),
+    };
+    let payload = BigUint::from_be_bytes(&framed);
+    embed_loop(&payload, &key, message, needed, min_len, species)
 }
 
 /// M9: like `embed`, but the region is triplicated so that extraction
 /// survives any single-byte corruption of the payload integer (majority
 /// vote). Costs 3x capacity; message cap is `EC_MAX_MESSAGE` (64 bytes).
+/// ECC regions stay in the v0.2 species-1 format (decision D3).
 pub fn embed_with_ecc(
     message: &[u8],
     passphrase: &str,
     nonce: u64,
     min_len: usize,
 ) -> Result<(Composition, usize), StegoError> {
-    embed_inner(message, passphrase, nonce, min_len, true)
-}
-
-fn embed_inner(
-    message: &[u8],
-    passphrase: &str,
-    nonce: u64,
-    min_len: usize,
-    ecc: bool,
-) -> Result<(Composition, usize), StegoError> {
-    let max_msg = if ecc { EC_MAX_MESSAGE } else { 255 };
-    if message.len() > max_msg {
+    if message.len() > EC_MAX_MESSAGE {
         return Err(StegoError::Decode(format!(
-            "message exceeds {max_msg} bytes"
+            "message exceeds {EC_MAX_MESSAGE} bytes"
         )));
     }
-    let needed = if ecc {
-        (1 + 3 * (MIN_REGION + message.len())) * 8
-    } else {
-        framing_bits(message.len())
-    };
-    // Derive once: stretching is ~100k SHA-256 rounds and the loop below
-    // may try many score lengths.
     let key = keys::derive_key(passphrase, nonce);
-    let framed = if ecc {
-        build_framed_ec(message, &key, nonce)
-    } else {
-        build_framed(message, &key, nonce)
-    };
+    let framed = build_framed_ec(message, &key, nonce);
     let payload = BigUint::from_be_bytes(&framed);
-    let mut last_capacity = 0usize;
-    for ext in 0..128 {
-        let len = min_len + ext * 8;
-        let mut chooser = AcChooser {
-            dec: ac::RadixDecoder::new(payload.clone()),
-        };
-        let comp = compose_with(len, &mut chooser);
-        last_capacity = decisions_of(&comp.cf, &comp.cp)
-            .map(|ds| path_bits(&ds))
-            .unwrap_or(0);
-        if last_capacity >= needed
-            && matches!(
-                extract_with_key(&comp.cf, &comp.cp, &key).as_deref(),
-                Ok(out) if out == message
-            )
-        {
-            return Ok((comp, len));
-        }
+    let needed = (1 + 3 * (MIN_REGION + message.len())) * 8;
+    match embed_loop(&payload, &key, message, needed, min_len, Species::First)? {
+        (Embedded::First(comp), len) => Ok((comp, len)),
+        _ => unreachable!("ECC embed is species-1 only"),
     }
-    Err(StegoError::CapacityExceeded {
-        needed_bits: needed,
-        capacity_bits: last_capacity,
-    })
 }
 
 /// Extract a message from a composition's notes with an already-derived key
 /// (decoder side; `extract` derives the key from the parsed nonce first).
 pub fn extract_with_key(cf: &[Note], cp: &[Note], key: &[u8; 32]) -> Result<Vec<u8>, StegoError> {
-    let decisions = decisions_of(cf, cp).map_err(StegoError::Decode)?;
+    let decisions = decisions_for(cf, cp).map_err(StegoError::Decode)?;
     let bytes = unwrap_ec(&rebuild(&decisions))?;
-    let (_nonce, claimed) = parse_region(&bytes)?;
+    let region = parse_region(&bytes)?;
 
-    // The key-derived IV authenticates the framing boundary: anything but
-    // the exact key fails here before `claimed` is ever used as a length.
-    let iv = keys::sha256(&[b"countersteg-ac-iv", key]);
+    // Cross-check: the framing-declared species must agree with the cover's
+    // voice geometry (the replay above already pinned it). The MAC would
+    // catch a flip downstream too, but a disagreement here is tampering —
+    // fail closed, indistinguishable from a wrong key.
+    if detect_species(cf, cp) != Some(region.species) {
+        return Err(StegoError::WrongKey);
+    }
+
+    // The key-derived IV authenticates the framing boundary with the
+    // version-specific domain: anything but the exact key fails here before
+    // `claimed` is ever used as a length.
+    let iv_domain: &[u8] = match region.framing {
+        Framing::V2 => b"countersteg-ac-iv",
+        Framing::V3 => b"countersteg-ac-iv-v3",
+    };
+    let iv = keys::sha256(&[iv_domain, key]);
     if bytes[1..HEADER_BYTES] != iv[..IV_BYTES] {
         return Err(StegoError::WrongKey);
     }
 
-    let body_start = HEADER_BYTES + NONCE_BYTES + LEN_BYTES;
-    let mut body = bytes[body_start..body_start + claimed].to_vec();
-    let tag: [u8; TAG_BYTES] = bytes[body_start + claimed..body_start + claimed + TAG_BYTES]
+    let body_start = region.body_start;
+    let mut body = bytes[body_start..body_start + region.claimed].to_vec();
+    let tag: [u8; TAG_BYTES] = bytes[body_start + region.claimed..body_start + region.claimed + TAG_BYTES]
         .try_into()
         .unwrap();
     if keys::mac_tag_from_key(key, &body) != tag {
@@ -354,10 +592,10 @@ pub fn extract_with_key(cf: &[Note], cp: &[Note], key: &[u8; 32]) -> Result<Vec<
 /// Extract a message from a composition's notes (decoder side).
 /// The nonce is parsed from the framing; only the passphrase is needed.
 pub fn extract(cf: &[Note], cp: &[Note], passphrase: &str) -> Result<Vec<u8>, StegoError> {
-    let decisions = decisions_of(cf, cp).map_err(StegoError::Decode)?;
+    let decisions = decisions_for(cf, cp).map_err(StegoError::Decode)?;
     let bytes = unwrap_ec(&rebuild(&decisions))?;
-    let (nonce, _claimed) = parse_region(&bytes)?;
-    let key = keys::derive_key(passphrase, nonce);
+    let region = parse_region(&bytes)?;
+    let key = keys::derive_key(passphrase, region.nonce);
     extract_with_key(cf, cp, &key)
 }
 
@@ -397,7 +635,7 @@ pub fn embed_split(
         payload.push(count as u8);
         payload.push(part.len() as u8);
         payload.extend_from_slice(part);
-        let (comp, _) = embed_inner(&payload, passphrase, nonce.wrapping_add(i as u64), min_len, false)?;
+        let (comp, _) = embed(&payload, passphrase, nonce.wrapping_add(i as u64), min_len)?;
         comps.push(comp);
     }
     Ok(comps)
@@ -515,6 +753,96 @@ mod tests {
         assert_eq!(&ec[1..1 + 49], &build_framed(b"vector", &key, 0x0102030405060708)[..]);
     }
 
+    /// v0.3 known-answer vectors, same construction as
+    /// `framed_region_known_answers`: pins the v3 sentinel, the
+    /// version-separated IV domain, the species byte, and the trailer.
+    /// Captured from real runs; a regression anywhere in that chain changes
+    /// these bytes and fails here.
+    #[test]
+    fn framed_v3_known_answers() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let key = keys::derive_key("integrity vector", 0x0102030405060708);
+        assert_eq!(
+            hex(&build_framed_v3(b"vector", &key, 0x0102030405060708, Species::Second)),
+            "037b2f517f52709d0184c95fe91daf3171\
+             0807060504030201020603\
+             894c3e7cd6d700212dd83416ea9317d82c2dac3d4803"
+        );
+        // Minimal region with the species-1 byte: still v3 framing.
+        assert_eq!(
+            hex(&build_framed_v3(b"", &key, 0, Species::First)),
+            "037b2f517f52709d0184c95fe91daf3171\
+             00000000000000000100\
+             a63e590505b2189223962b7db9f705fc03"
+        );
+    }
+
+    #[test]
+    fn framed_v3_layout_and_stable_ends() {
+        let key = keys::derive_key("pw", 42);
+        let framed = build_framed_v3(b"hi", &key, 42, Species::Second);
+        assert_eq!(framed[0], SENTINEL_V3);
+        assert_eq!(framed[framed.len() - 1], TRAILER_V3);
+        assert_eq!(framed.len(), V3_MIN_REGION + 2);
+        assert_eq!(framed[HEADER_BYTES + NONCE_BYTES], 0x02); // species byte
+        let x = BigUint::from_be_bytes(&framed);
+        assert_eq!(x.to_be_bytes(), framed);
+    }
+
+    #[test]
+    fn v3_rejects_bad_species_byte() {
+        let key = keys::derive_key("pw", 9);
+        let mut framed = build_framed_v3(b"hi", &key, 9, Species::Second);
+        framed[HEADER_BYTES + NONCE_BYTES] = 0x07;
+        assert!(matches!(parse_region(&framed), Err(StegoError::WrongKey)));
+    }
+
+    #[test]
+    fn v2_and_v3_parse_under_their_own_layout() {
+        let key = keys::derive_key("pw", 9);
+        let v2 = build_framed(b"hi", &key, 9);
+        let r2 = parse_region(&v2).unwrap();
+        assert_eq!(r2.framing, Framing::V2);
+        assert_eq!(r2.species, Species::First);
+        // A v3 frame declaring species 1 parses too — the parser accepts
+        // any declared species; embed never produces this combination.
+        let v3 = build_framed_v3(b"hi", &key, 9, Species::First);
+        let r3 = parse_region(&v3).unwrap();
+        assert_eq!(r3.framing, Framing::V3);
+        assert_eq!(r3.species, Species::First);
+    }
+
+    #[test]
+    fn v3_species_geometry_crosscheck_rejects_mismatch() {
+        // A v3 frame declaring species 2 steered into a species-1 cover must
+        // fail closed at the geometry cross-check, not decode garbage.
+        let key = keys::derive_key("pw", 5);
+        let framed = build_framed_v3(b"hi", &key, 5, Species::Second);
+        let payload = BigUint::from_be_bytes(&framed);
+        let mut chooser = AcChooser {
+            dec: ac::RadixDecoder::new(payload),
+        };
+        let comp = compose_with(16, &mut chooser);
+        let res = extract_with_key(&comp.cf, &comp.cp, &key);
+        assert!(matches!(res, Err(StegoError::WrongKey)));
+    }
+
+    #[test]
+    fn species2_embed_uses_v3_framing() {
+        let msg = b"framing probe";
+        let (comp, _) = embed_species(msg, "pw", 7, 16, Species::Second).unwrap();
+        let (cf, cp) = match &comp {
+            Embedded::Second(c) => (&c.cf, &c.cp),
+            Embedded::First(_) => panic!("expected second species"),
+        };
+        let ds = decisions_for(cf, cp).unwrap();
+        let bytes = unwrap_ec(&rebuild(&ds)).unwrap();
+        let region = parse_region(&bytes).unwrap();
+        assert_eq!(region.framing, Framing::V3);
+        assert_eq!(region.species, Species::Second);
+        assert_eq!(extract(cf, cp, "pw").unwrap(), msg);
+    }
+
     #[test]
     fn roundtrip_short_message() {
         let msg = b"hi";
@@ -531,6 +859,44 @@ mod tests {
             let out = extract(&comp.cf, &comp.cp, "s3cret").unwrap();
             assert_eq!(out, msg, "nonce {nonce}");
         }
+    }
+
+    #[test]
+    fn roundtrip_species2() {
+        // Auto-detection proof: extract() takes no species argument; the
+        // voice geometry (cp.len() == 2 * cf.len()) drives the replay.
+        let msg = b"second species payload";
+        let (comp, len) = embed_species(msg, "pw", 42, 16, Species::Second).unwrap();
+        let (cf, cp) = match &comp {
+            Embedded::First(_) => panic!("expected a second-species composition"),
+            Embedded::Second(c) => (c.cf.clone(), c.cp.clone()),
+        };
+        assert_eq!(cp.len(), 2 * cf.len());
+        assert_eq!(extract(&cf, &cp, "pw").unwrap(), msg);
+        assert_eq!(extract_with_key(&cf, &cp, &keys::derive_key("pw", 42)).unwrap(), msg);
+        let _ = len;
+    }
+
+    #[test]
+    fn species2_capacity_exceeds_species1() {
+        // Same bar count, both species: the half-note grid is strictly wider.
+        for nonce in 0..8u64 {
+            for len in [8usize, 16, 32] {
+                let s1 = available_bits_species(nonce, len, Species::First);
+                let s2 = available_bits_species(nonce, len, Species::Second);
+                assert!(s2 > s1, "nonce {nonce} len {len}: species2 {s2} <= species1 {s1}");
+            }
+        }
+    }
+
+    #[test]
+    fn replay_rejects_unknown_geometry() {
+        // cp lengths that match neither species are a decode error, not a
+        // panic or a mis-dispatch.
+        let cf: Vec<Note> = engine::compose(1, 8).cf;
+        let short_cp: Vec<Note> = engine::compose(1, 8).cp[..7].to_vec();
+        let res = extract(&cf, &short_cp, "pw");
+        assert!(matches!(res, Err(StegoError::Decode(_))));
     }
 
     #[test]
@@ -637,6 +1003,47 @@ mod tests {
         assert!(!tv.is_empty(), "no overlapping arity buckets");
         for (arity, d) in tv {
             assert!(d < 0.15, "arity {arity}: total variation {d:.3} vs natural");
+        }
+    }
+
+    /// M8, species 2: the same warden test against the second-species
+    /// generator — embed via v0.3 framing across 24 fixed nonces and compare
+    /// the per-arity choice distribution against the natural `compose2`
+    /// baseline. The species-1 assertions above are unchanged; species 2
+    /// gets its own bound because its arity histogram shifts (boundary
+    /// upbeats are forced arity-1, zero-bit decisions) even under a perfect
+    /// encoder.
+    #[test]
+    fn self_steganalysis_distribution_matches_natural_species2() {
+        let msg = b"distribution probe";
+        let len = 64;
+        let mut embedded: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        let mut natural: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for seed in 0..24u64 {
+            let (comp, _) =
+                embed_species(msg, "pw", 1_000 + seed, len, Species::Second).unwrap();
+            let Embedded::Second(comp) = comp else {
+                panic!("species-2 embed must yield Embedded::Second");
+            };
+            let ds = decisions_of2(&comp.cf, &comp.cp).unwrap();
+            for (arity, counts) in tally(&ds) {
+                let v = embedded.entry(arity).or_insert_with(|| vec![0; arity as usize]);
+                for (i, c) in counts.iter().enumerate() {
+                    v[i] += c;
+                }
+            }
+            let nat = engine::species::second::compose2(seed, len);
+            for (arity, counts) in tally(&nat.decisions) {
+                let v = natural.entry(arity).or_insert_with(|| vec![0; arity as usize]);
+                for (i, c) in counts.iter().enumerate() {
+                    v[i] += c;
+                }
+            }
+        }
+        let tv = total_variation(&embedded, &natural);
+        assert!(!tv.is_empty(), "no overlapping arity buckets");
+        for (arity, d) in tv {
+            assert!(d < 0.20, "species-2 arity {arity}: total variation {d:.3} vs natural");
         }
     }
 
